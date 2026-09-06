@@ -182,11 +182,25 @@ else
     ok "Tailscale already installed"
 fi
 
+# POST $1=path $2=json-body. Prints the response body on 2xx; on any other
+# status, fails with the actual HTTP status + response body — a bad token
+# (401), Tailscale not yet configured on the hub (503), or a stale deploy
+# (404) each look different, and a bare "curl failed" hid that distinction.
+hub_post() {
+    local path="$1" body="$2" raw status resp
+    raw="$(curl -s -m 30 -w '\n%{http_code}' -X POST "$HUB_URL$path" \
+        -H 'Content-Type: application/json' -d "$body")" \
+        || fail "$HUB_URL$path — not reachable (network/DNS)."
+    status="${raw##*$'\n'}"
+    resp="${raw%$'\n'*}"
+    if [ "$status" -lt 200 ] || [ "$status" -ge 300 ]; then
+        fail "$HUB_URL$path -> HTTP $status: $resp"
+    fi
+    printf '%s' "$resp"
+}
+
 say "Requesting a Tailscale join key from $HUB_URL…"
-ENROLL_RESP="$(curl -sf -X POST "$HUB_URL/api/nodes/enroll" \
-    -H 'Content-Type: application/json' \
-    -d "{\"token\":\"$TOKEN\"}")" \
-    || fail "Enrollment failed — check the token and that $HUB_URL is reachable."
+ENROLL_RESP="$(hub_post /api/nodes/enroll "{\"token\":\"$TOKEN\"}")"
 AUTHKEY="$(printf '%s' "$ENROLL_RESP" | python3 -c 'import json,sys; print(json.load(sys.stdin)["tailscale_authkey"])')"
 [ -n "$AUTHKEY" ] || fail "Hub didn't return a Tailscale auth key: $ENROLL_RESP"
 
@@ -205,10 +219,7 @@ done
 ok "tailnet IP: $TS_IP"
 
 say "Registering with $HUB_URL as an enabled backend…"
-REGISTER_RESP="$(curl -sf -X POST "$HUB_URL/api/nodes/register" \
-    -H 'Content-Type: application/json' \
-    -d "{\"token\":\"$TOKEN\",\"name\":\"$NODE_NAME\",\"tailscale_ip\":\"$TS_IP\",\"ollama_port\":$OLLAMA_PORT}")" \
-    || fail "Registration failed."
+REGISTER_RESP="$(hub_post /api/nodes/register "{\"token\":\"$TOKEN\",\"name\":\"$NODE_NAME\",\"tailscale_ip\":\"$TS_IP\",\"ollama_port\":$OLLAMA_PORT}")"
 ok "registered: $REGISTER_RESP"
 
 # ---------- 5. ask (edstui) ----------
