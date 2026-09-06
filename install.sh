@@ -99,6 +99,8 @@ else
 fi
 [ -n "$TOKEN" ] || fail "An enrollment token is required — mint one in miniaicloud's admin panel first (or set MINICLOSEDAI_NODE_TOKEN, e.g. when no terminal is attached)."
 
+SUDO=""; [ "$(id -u)" != "0" ] && command -v sudo >/dev/null 2>&1 && SUDO="sudo"
+
 # ---------- 2. Ollama + model ----------
 if ! command -v ollama >/dev/null 2>&1; then
     say "Installing Ollama…"
@@ -108,12 +110,43 @@ else
     ok "Ollama already installed"
 fi
 
-# The official Linux installer registers a systemd service that starts
-# automatically; on macOS the Ollama app/CLI serves on demand. Either way,
-# make sure something is actually listening before we try to pull.
+# Ollama binds 127.0.0.1 only by default — invisible to the relay over
+# Tailscale no matter how well the tailnet itself is configured (this is
+# exactly what made an earlier real node land "ejected": tailnet reachable,
+# port refused). Force it onto all interfaces BEFORE the readiness check
+# below, and do this unconditionally — not just on a fresh install — since
+# Ollama may already have been installed (as it was here) with its systemd
+# unit's default binding, outside this script's control.
+ensure_ollama_listens_on_all_interfaces() {
+    local desired="OLLAMA_HOST=0.0.0.0:${OLLAMA_PORT}"
+    if command -v systemctl >/dev/null 2>&1 && systemctl list-unit-files ollama.service >/dev/null 2>&1; then
+        local override_dir=/etc/systemd/system/ollama.service.d
+        local override_file="$override_dir/override.conf"
+        if [ -f "$override_file" ] && grep -q "OLLAMA_HOST=0\.0\.0\.0" "$override_file" 2>/dev/null; then
+            ok "Ollama already configured to listen on all interfaces"
+            return
+        fi
+        say "Configuring Ollama to listen on all interfaces (so the relay can reach it over Tailscale)…"
+        $SUDO mkdir -p "$override_dir"
+        printf '[Service]\nEnvironment="%s"\n' "$desired" | $SUDO tee "$override_file" >/dev/null
+        $SUDO systemctl daemon-reload
+        $SUDO systemctl restart ollama
+        ok "Ollama now listens on 0.0.0.0:${OLLAMA_PORT}"
+    else
+        # No systemd (macOS, or a non-systemd Linux) — best effort: export for
+        # this script's own fallback `ollama serve` below. If Ollama is
+        # already running as its own app/service outside this script, it
+        # needs OLLAMA_HOST set and a manual restart for this to take effect.
+        export OLLAMA_HOST="0.0.0.0:${OLLAMA_PORT}"
+        warn "No systemd unit found for Ollama — if it's already running as its own app/service, set OLLAMA_HOST=0.0.0.0:${OLLAMA_PORT} and restart it manually."
+    fi
+}
+ensure_ollama_listens_on_all_interfaces
+
+# Make sure something is actually listening before we try to pull.
 if ! curl -sf -m 2 "http://127.0.0.1:${OLLAMA_PORT}/api/tags" >/dev/null 2>&1; then
     say "Starting Ollama…"
-    nohup ollama serve >/tmp/miniclosedai-node-ollama.log 2>&1 &
+    OLLAMA_HOST="0.0.0.0:${OLLAMA_PORT}" nohup ollama serve >/tmp/miniclosedai-node-ollama.log 2>&1 &
     disown
     for _ in $(seq 1 20); do
         sleep 0.5
@@ -205,7 +238,6 @@ AUTHKEY="$(printf '%s' "$ENROLL_RESP" | python3 -c 'import json,sys; print(json.
 [ -n "$AUTHKEY" ] || fail "Hub didn't return a Tailscale auth key: $ENROLL_RESP"
 
 say "Joining the tailnet (this also enables Tailscale SSH — no separate keys to manage)…"
-SUDO=""; [ "$(id -u)" != "0" ] && command -v sudo >/dev/null 2>&1 && SUDO="sudo"
 $SUDO tailscale up --authkey="$AUTHKEY" --ssh --hostname="$NODE_NAME" --accept-routes
 ok "joined the tailnet as $NODE_NAME"
 
