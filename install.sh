@@ -272,21 +272,59 @@ done
 [ -n "$TS_IP" ] || fail "Joined the tailnet but couldn't read this node's IP (tailscale ip -4)."
 ok "tailnet IP: $TS_IP"
 
+# A host firewall commonly permits loopback but blocks inbound connections
+# on tailscale0 — invisible to both the earlier `ss` bind check and a plain
+# `curl 127.0.0.1` test, but exactly what would leave a node "ejected" even
+# though Ollama is correctly bound to all interfaces. Open it proactively
+# where ufw is in play; best-effort, not fatal if ufw isn't used at all.
+if command -v ufw >/dev/null 2>&1 && $SUDO ufw status 2>/dev/null | grep -q "^Status: active"; then
+    say "Opening :${OLLAMA_PORT} for the tailscale0 interface (ufw is active)…"
+    $SUDO ufw allow in on tailscale0 to any port "$OLLAMA_PORT" proto tcp comment 'miniclosedai-node: relay access' >/dev/null
+    ok "ufw rule added for tailscale0:${OLLAMA_PORT}"
+fi
+
+# The definitive test: curl this node's OWN tailnet address, not loopback —
+# the exact address:port the relay's health probe will use. SSH working is
+# NOT evidence this works: Tailscale SSH is authorized through its own
+# separate `ssh` ACL policy, independent of the general `acls` rules that
+# govern reachability to every other port. Refuse to register a backend
+# with the relay until this has actually been proven over the real path,
+# rather than finding out afterward from miniaicloud's side.
+say "Verifying the node is reachable at its tailnet address (the same path the relay will use)…"
+curl -sf -m 5 "http://${TS_IP}:${OLLAMA_PORT}/api/tags" >/dev/null 2>&1 \
+    || fail "Ollama's bind was already confirmed correct (0.0.0.0:${OLLAMA_PORT}, via ss), but $TS_IP:${OLLAMA_PORT} still refuses a connection from this same machine — almost certainly a firewall (ufw/iptables) blocking the tailscale0 interface, not an Ollama config problem. Check 'sudo ufw status' / 'sudo iptables -L -n', allow inbound :${OLLAMA_PORT} on tailscale0, then re-run."
+ok "confirmed reachable at ${TS_IP}:${OLLAMA_PORT} — the same address the relay will probe"
+
 say "Registering with $HUB_URL as an enabled backend…"
 REGISTER_RESP="$(hub_post /api/nodes/register "{\"token\":\"$TOKEN\",\"name\":\"$NODE_NAME\",\"tailscale_ip\":\"$TS_IP\",\"ollama_port\":$OLLAMA_PORT}")"
 ok "registered: $REGISTER_RESP"
 
 # ---------- 5. ask (edstui) ----------
+# `pip install --user pipx` alone fails outright on modern Debian/Ubuntu
+# (PEP 668 "externally managed environment") unless --break-system-packages
+# is passed or apt is used instead — and the old `|| warn` here swallowed
+# that failure silently, so pipx (and therefore `ask`) never actually got
+# installed. Try apt first (Debian/Ubuntu's own recommended path, sidesteps
+# PEP 668 entirely), then pip with the override flag, then plain pip for
+# older systems that predate PEP 668 altogether.
 if ! command -v pipx >/dev/null 2>&1; then
     say "Installing pipx (for the \`ask\` CLI)…"
-    python3 -m pip install -q --user pipx || warn "could not install pipx — skipping \`ask\` setup"
+    if command -v apt-get >/dev/null 2>&1; then
+        $SUDO apt-get update -qq && $SUDO apt-get install -y -qq pipx
+    fi
+    if ! command -v pipx >/dev/null 2>&1; then
+        python3 -m pip install -q --user pipx --break-system-packages 2>/dev/null \
+            || python3 -m pip install -q --user pipx
+    fi
     python3 -m pipx ensurepath >/dev/null 2>&1 || true
     export PATH="$HOME/.local/bin:$PATH"
 fi
 if command -v pipx >/dev/null 2>&1; then
     say "Installing the \`ask\` CLI (edstui)…"
     pipx install --quiet --force "$ASK_REPO" && ok "ask CLI ready — run \`ask\` from any shell" \
-        || warn "pipx install of $ASK_REPO failed — re-run later: pipx install --force $ASK_REPO"
+        || warn "pipx install of $ASK_REPO failed (network?) — the node is already registered; re-run later: pipx install --force $ASK_REPO"
+else
+    warn "pipx still isn't installed after apt/pip attempts — \`ask\` was skipped. The node is already registered; install pipx manually, then: pipx install --force $ASK_REPO"
 fi
 
 echo
