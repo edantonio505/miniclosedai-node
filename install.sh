@@ -112,33 +112,41 @@ fi
 
 # Ollama binds 127.0.0.1 only by default — invisible to the relay over
 # Tailscale no matter how well the tailnet itself is configured (this is
-# exactly what made an earlier real node land "ejected": tailnet reachable,
-# port refused). Force it onto all interfaces BEFORE the readiness check
-# below, and do this unconditionally — not just on a fresh install — since
-# Ollama may already have been installed (as it was here) with its systemd
-# unit's default binding, outside this script's control.
+# exactly what made real nodes land "ejected": tailnet reachable, port
+# refused). Force it onto all interfaces unconditionally — not just on a
+# fresh install, since Ollama may already have been present with its
+# systemd unit's default binding, outside this script's control — and then
+# ACTUALLY VERIFY the bind took, rather than trusting that `systemctl
+# restart` succeeding means the override applied. Repeated real installs
+# hit exactly this trap: a previous partial run left a plausible-looking
+# override.conf on disk with the daemon never actually reloaded/restarted
+# against it, so a "does the file already look right, skip re-applying"
+# shortcut would have kept re-registering a still-broken node every time.
 ensure_ollama_listens_on_all_interfaces() {
     local desired="OLLAMA_HOST=0.0.0.0:${OLLAMA_PORT}"
-    if command -v systemctl >/dev/null 2>&1 && systemctl list-unit-files ollama.service >/dev/null 2>&1; then
+    if command -v systemctl >/dev/null 2>&1 \
+        && [ "$(systemctl show -p LoadState --value ollama.service 2>/dev/null)" = "loaded" ]; then
         local override_dir=/etc/systemd/system/ollama.service.d
-        local override_file="$override_dir/override.conf"
-        if [ -f "$override_file" ] && grep -q "OLLAMA_HOST=0\.0\.0\.0" "$override_file" 2>/dev/null; then
-            ok "Ollama already configured to listen on all interfaces"
-            return
-        fi
         say "Configuring Ollama to listen on all interfaces (so the relay can reach it over Tailscale)…"
         $SUDO mkdir -p "$override_dir"
-        printf '[Service]\nEnvironment="%s"\n' "$desired" | $SUDO tee "$override_file" >/dev/null
+        printf '[Service]\nEnvironment="%s"\n' "$desired" | $SUDO tee "$override_dir/override.conf" >/dev/null
         $SUDO systemctl daemon-reload
         $SUDO systemctl restart ollama
-        ok "Ollama now listens on 0.0.0.0:${OLLAMA_PORT}"
+        sleep 1
+        local applied
+        applied="$(systemctl show -p Environment --value ollama.service 2>/dev/null)"
+        case "$applied" in
+            *"OLLAMA_HOST=0.0.0.0"*) ok "systemd override applied: $applied" ;;
+            *) fail "systemd override didn't take — 'systemctl show ollama.service -p Environment' shows: ${applied:-<empty>}. Check for a competing unit (systemctl list-units '*ollama*') or a user-level override, then re-run." ;;
+        esac
     else
-        # No systemd (macOS, or a non-systemd Linux) — best effort: export for
+        # No systemd-managed ollama.service (macOS, a non-systemd Linux, or
+        # Ollama running some other way entirely) — best effort: export for
         # this script's own fallback `ollama serve` below. If Ollama is
         # already running as its own app/service outside this script, it
         # needs OLLAMA_HOST set and a manual restart for this to take effect.
         export OLLAMA_HOST="0.0.0.0:${OLLAMA_PORT}"
-        warn "No systemd unit found for Ollama — if it's already running as its own app/service, set OLLAMA_HOST=0.0.0.0:${OLLAMA_PORT} and restart it manually."
+        warn "No systemd-managed ollama.service found — if Ollama is already running some other way, set OLLAMA_HOST=0.0.0.0:${OLLAMA_PORT} and restart it manually."
     fi
 }
 ensure_ollama_listens_on_all_interfaces
@@ -155,6 +163,20 @@ if ! curl -sf -m 2 "http://127.0.0.1:${OLLAMA_PORT}/api/tags" >/dev/null 2>&1; t
 fi
 curl -sf -m 2 "http://127.0.0.1:${OLLAMA_PORT}/api/tags" >/dev/null 2>&1 \
     || fail "Ollama isn't answering on :${OLLAMA_PORT} — check /tmp/miniclosedai-node-ollama.log"
+
+# The check above only proves localhost reachability — 127.0.0.1-only
+# binding (the exact bug this whole function exists to prevent) would pass
+# it too. This is the real test: confirm the listening socket itself is on
+# all interfaces before ever proceeding to register with the relay.
+if command -v ss >/dev/null 2>&1; then
+    BOUND="$(ss -ltn "sport = :${OLLAMA_PORT}" 2>/dev/null | tail -n +2)"
+    case "$BOUND" in
+        *"0.0.0.0:${OLLAMA_PORT}"*|*"*:${OLLAMA_PORT}"*|*":::${OLLAMA_PORT}"*)
+            ok "Ollama confirmed listening on all interfaces (:${OLLAMA_PORT})" ;;
+        *)
+            fail "Ollama is only reachable on: ${BOUND:-<nothing found on that port>} — expected 0.0.0.0:${OLLAMA_PORT}. The relay would not be able to reach this node; refusing to register a backend that's known to be broken." ;;
+    esac
+fi
 
 say "Pulling ${OLLAMA_MODEL} (fits an 8GB card with headroom)…"
 ollama pull "$OLLAMA_MODEL"
