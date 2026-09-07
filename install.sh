@@ -15,7 +15,11 @@
 #   2. Installs Ollama (official installer) and pulls the model — default
 #      qwen3.5:9b-q4_K_M, 6.6GB, chosen specifically because it fits an
 #      8GB-VRAM card with headroom (the bare qwen3.5:9b tag and the q8_0
-#      variant, at 11GB, do not).
+#      variant, at 11GB, do not). Sets OLLAMA_KEEP_ALIVE=-1 and explicitly
+#      loads the model into memory right away, so it stays resident forever
+#      instead of unloading after Ollama's default 5-minute idle timeout —
+#      the relay may route to this node unpredictably, and a cold-load on
+#      the first request after any quiet period would be bad latency.
 #   3. Asks whether to also run a local Latina voice pod (latinavoicepod) on
 #      this node — Linux only (its own start.sh assumes apt-get + a
 #      CUDA-matched torch build). Skip if this node is already tight on
@@ -141,13 +145,18 @@ ollama_bound_to_all_interfaces() {
 }
 
 ensure_ollama_listens_on_all_interfaces() {
-    local desired="OLLAMA_HOST=0.0.0.0:${OLLAMA_PORT}"
+    # OLLAMA_KEEP_ALIVE=-1 alongside the bind fix: Ollama unloads an idle
+    # model after 5 minutes by default, which would mean the first request
+    # to this node after any quiet period pays a multi-second cold-load
+    # penalty — bad for a node meant to answer relay traffic on demand.
+    # -1 means never unload once loaded.
     if command -v systemctl >/dev/null 2>&1 \
         && [ "$(systemctl show -p LoadState --value ollama.service 2>/dev/null)" = "loaded" ]; then
         local override_dir=/etc/systemd/system/ollama.service.d
-        say "Configuring Ollama to listen on all interfaces (so the relay can reach it over Tailscale)…"
+        say "Configuring Ollama to listen on all interfaces and keep the model loaded forever…"
         $SUDO mkdir -p "$override_dir"
-        printf '[Service]\nEnvironment="%s"\n' "$desired" | $SUDO tee "$override_dir/override.conf" >/dev/null
+        printf '[Service]\nEnvironment="OLLAMA_HOST=0.0.0.0:%s"\nEnvironment="OLLAMA_KEEP_ALIVE=-1"\n' \
+            "$OLLAMA_PORT" | $SUDO tee "$override_dir/override.conf" >/dev/null
         $SUDO systemctl daemon-reload
         $SUDO systemctl restart ollama
         sleep 1
@@ -181,7 +190,8 @@ ensure_ollama_listens_on_all_interfaces() {
         # already running as its own app/service outside this script, it
         # needs OLLAMA_HOST set and a manual restart for this to take effect.
         export OLLAMA_HOST="0.0.0.0:${OLLAMA_PORT}"
-        warn "No systemd-managed ollama.service found — if Ollama is already running some other way, set OLLAMA_HOST=0.0.0.0:${OLLAMA_PORT} and restart it manually."
+        export OLLAMA_KEEP_ALIVE=-1
+        warn "No systemd-managed ollama.service found — if Ollama is already running some other way, set OLLAMA_HOST=0.0.0.0:${OLLAMA_PORT} and OLLAMA_KEEP_ALIVE=-1 and restart it manually."
     fi
 }
 ensure_ollama_listens_on_all_interfaces
@@ -189,7 +199,7 @@ ensure_ollama_listens_on_all_interfaces
 # Make sure something is actually listening before we try to pull.
 if ! curl -sf -m 2 "http://127.0.0.1:${OLLAMA_PORT}/api/tags" >/dev/null 2>&1; then
     say "Starting Ollama…"
-    OLLAMA_HOST="0.0.0.0:${OLLAMA_PORT}" nohup ollama serve >/tmp/miniclosedai-node-ollama.log 2>&1 &
+    OLLAMA_HOST="0.0.0.0:${OLLAMA_PORT}" OLLAMA_KEEP_ALIVE=-1 nohup ollama serve >/tmp/miniclosedai-node-ollama.log 2>&1 &
     disown
     for _ in $(seq 1 20); do
         sleep 0.5
@@ -210,6 +220,22 @@ ollama_bound_to_all_interfaces \
 say "Pulling ${OLLAMA_MODEL} (fits an 8GB card with headroom)…"
 ollama pull "$OLLAMA_MODEL"
 ok "model ready: $OLLAMA_MODEL"
+
+# Explicitly load the model into memory now, with an indefinite keep_alive,
+# instead of waiting for the first real inference request to pay the
+# multi-second cold-load cost. Omitting "prompt" is Ollama's documented way
+# to load (or, with keep_alive:0, unload) a model without generating a
+# completion — nothing is sent to the model, this only warms it into VRAM.
+say "Loading ${OLLAMA_MODEL} into memory (keep_alive: forever)…"
+curl -sf -m 120 -X POST "http://127.0.0.1:${OLLAMA_PORT}/api/generate" \
+    -H 'Content-Type: application/json' \
+    -d "{\"model\":\"${OLLAMA_MODEL}\",\"keep_alive\":-1}" >/dev/null \
+    || warn "couldn't pre-load ${OLLAMA_MODEL} — it will still load on its first real request, just with a one-time delay"
+if ollama ps 2>/dev/null | grep -qF "$OLLAMA_MODEL"; then
+    ok "model loaded and resident (will not unload)"
+else
+    warn "model doesn't show as loaded in 'ollama ps' — check 'sudo journalctl -u ollama -n 30 --no-pager' if the node responds slowly to its first request"
+fi
 
 # ---------- 3. Optional local voice pod (Linux only) ----------
 if [ -n "${MINICLOSEDAI_NODE_VOICE:-}" ]; then
