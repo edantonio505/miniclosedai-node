@@ -15,9 +15,14 @@ as much of a small card's VRAM as possible for the model itself.
 1. Takes an **enrollment token**, minted ahead of time by an admin in
    miniaicloud's admin panel (Node tokens page). The token is the trust
    gate — no separate manual approval step per node.
-2. Installs **Ollama** and pulls `qwen3.5:9b-q4_K_M` (6.6GB — fits an 8GB
-   card with headroom; the bare `qwen3.5:9b` tag and the `q8_0` variant, at
-   11GB, do not).
+2. Installs **Ollama** and pulls `qwen3.5:4b` (3.4GB weights). Also sets
+   `OLLAMA_CONTEXT_LENGTH=32768` explicitly, rather than trusting Ollama's
+   own VRAM-tiered auto-default (under 24GiB VRAM, it silently picks a
+   cramped 4096 tokens). Measured total footprint at that context: ~4.4GB —
+   comfortably under a 6GB budget with real headroom on an 8GB card. (The
+   9b variant's weights alone are 6.6GB, already over 6GB before any
+   context or overhead — set `OLLAMA_MODEL=qwen3.5:9b-q4_K_M` if you'd
+   rather trade VRAM headroom for a larger model.)
 3. *(Linux only)* Optionally installs a local **Latina voice pod**
    ([latinavoicepod](https://github.com/edantonio505/latinavoicepod)) —
    asked interactively, since it competes with the LLM for the same VRAM.
@@ -71,8 +76,9 @@ already set — useful for a non-interactive/scripted install.
 | `MINICLOSEDAI_NODE_TOKEN` | *(prompts)* | enrollment token from the admin panel |
 | `MINICLOSEDAI_NODE_NAME` | hostname | this node's name on the network and its Tailscale hostname |
 | `MINICLOSEDAI_NODE_VOICE` | *(prompts, Linux only)* | `1`/`0` — install a local Latina voice pod |
-| `OLLAMA_MODEL` | `qwen3.5:9b-q4_K_M` | model to pull |
+| `OLLAMA_MODEL` | `qwen3.5:4b` | model to pull |
 | `OLLAMA_PORT` | `11434` | port Ollama listens on |
+| `OLLAMA_CONTEXT_LENGTH` | `32768` | context window, in tokens |
 | `LATINA_DIR` | `$HOME/latinavoicepod` | where to clone latinavoicepod (Linux only) |
 | `ASK_REPO` | `git+https://github.com/edantonio505/edstui.git` | override for forks |
 

@@ -14,9 +14,14 @@
       1. Takes an enrollment token (minted by an admin in miniaicloud's
          admin panel: Node tokens page) — interactively, or via
          $env:MINICLOSEDAI_NODE_TOKEN to skip the prompt.
-      2. Installs Ollama and pulls the model — default qwen3.5:9b-q4_K_M,
-         6.6GB, chosen because it fits an 8GB-VRAM card with headroom (the
-         bare qwen3.5:9b tag and the q8_0 variant, at 11GB, do not).
+      2. Installs Ollama and pulls the model — default qwen3.5:4b (3.4GB
+         weights), with OLLAMA_CONTEXT_LENGTH set explicitly to 32768
+         rather than trusting Ollama's own VRAM-tiered auto-default (under
+         24GiB VRAM, it silently picks a cramped 4096 tokens). Measured
+         total footprint at that context: ~4.4GB, comfortably under a 6GB
+         budget with real headroom on an 8GB card. (The 9b variant's
+         weights alone are 6.6GB, already over 6GB before any context or
+         overhead.)
       3. Installs Tailscale, exchanges the enrollment token for a join key
          via miniaicloud's POST /api/nodes/enroll, runs `tailscale up
          --ssh --unattended` (keeps running after logout), then reports
@@ -36,8 +41,9 @@
       MINICLOSEDAI_HUB_URL     miniaicloud base URL (default: https://app.interdataresearch.ai)
       MINICLOSEDAI_NODE_TOKEN  enrollment token — skips the interactive prompt
       MINICLOSEDAI_NODE_NAME   this node's name on the network (default: hostname)
-      OLLAMA_MODEL             model to pull (default: qwen3.5:9b-q4_K_M)
+      OLLAMA_MODEL             model to pull (default: qwen3.5:4b)
       OLLAMA_PORT              port Ollama listens on (default: 11434)
+      OLLAMA_CONTEXT_LENGTH    context window, in tokens (default: 32768)
       ASK_REPO                 edstui repo to pipx-install
 #>
 
@@ -45,8 +51,9 @@ $ErrorActionPreference = "Stop"
 
 $HubUrl     = if ($env:MINICLOSEDAI_HUB_URL)   { $env:MINICLOSEDAI_HUB_URL }   else { "https://app.interdataresearch.ai" }
 $NodeName   = if ($env:MINICLOSEDAI_NODE_NAME) { $env:MINICLOSEDAI_NODE_NAME } else { $env:COMPUTERNAME }
-$OllamaModel = if ($env:OLLAMA_MODEL) { $env:OLLAMA_MODEL } else { "qwen3.5:9b-q4_K_M" }
+$OllamaModel = if ($env:OLLAMA_MODEL) { $env:OLLAMA_MODEL } else { "qwen3.5:4b" }
 $OllamaPort  = if ($env:OLLAMA_PORT)  { $env:OLLAMA_PORT }  else { 11434 }
+$OllamaContextLength = if ($env:OLLAMA_CONTEXT_LENGTH) { $env:OLLAMA_CONTEXT_LENGTH } else { 32768 }
 $AskRepo     = if ($env:ASK_REPO)     { $env:ASK_REPO }     else { "git+https://github.com/edantonio505/edstui.git" }
 
 function Say($msg)  { Write-Host $msg }
@@ -77,6 +84,23 @@ if (-not $Token) {
 if (-not $Token) { Fail "An enrollment token is required - mint one in miniaicloud's admin panel first." }
 
 # ---------- 2. Ollama + model ----------
+# Set OLLAMA_CONTEXT_LENGTH + OLLAMA_KEEP_ALIVE machine-wide (this script
+# already runs elevated) BEFORE Ollama's own first launch, so a fresh
+# install picks them up without a separate restart step. NOTE: if Ollama is
+# already installed and already running (the else branch below), this alone
+# will NOT change its behavior — a running process doesn't re-read the
+# environment. That mirrors a known, separate gap in this script: unlike
+# install.sh (which forces OLLAMA_HOST=0.0.0.0 via a systemd override +
+# verifies it with `ss`), this Windows path has no equivalent "restart
+# Ollama with new env vars" mechanism yet, for OLLAMA_HOST or these two. A
+# Windows node would hit the exact same 127.0.0.1-only-bind problem
+# install.sh had to fix on Linux. Untouched here deliberately — real,
+# separate work.
+[Environment]::SetEnvironmentVariable("OLLAMA_CONTEXT_LENGTH", "$OllamaContextLength", "Machine")
+[Environment]::SetEnvironmentVariable("OLLAMA_KEEP_ALIVE", "-1", "Machine")
+$env:OLLAMA_CONTEXT_LENGTH = "$OllamaContextLength"
+$env:OLLAMA_KEEP_ALIVE = "-1"
+
 if (-not (Get-Command ollama -ErrorAction SilentlyContinue)) {
     Say "Installing Ollama..."
     if (Get-Command winget -ErrorAction SilentlyContinue) {
@@ -89,6 +113,7 @@ if (-not (Get-Command ollama -ErrorAction SilentlyContinue)) {
     Ok "Ollama installed"
 } else {
     Ok "Ollama already installed"
+    Warn "OLLAMA_CONTEXT_LENGTH/OLLAMA_KEEP_ALIVE were just set, but an already-running Ollama won't pick them up without a restart (quit it from the system tray and reopen, or 'taskkill /IM ollama.exe /F' then relaunch)."
 }
 
 # The Windows installer registers Ollama to start on login and serve
@@ -103,9 +128,18 @@ for ($i = 0; $i -lt 20; $i++) {
 }
 if (-not $ollamaUp) { Fail "Ollama isn't answering on :$OllamaPort - open the Ollama app once and re-run." }
 
-Say "Pulling $OllamaModel (fits an 8GB card with headroom)..."
+Say "Pulling $OllamaModel (comfortably under a 6GB VRAM budget with room to spare)..."
 & ollama pull $OllamaModel
 Ok "model ready: $OllamaModel"
+
+Say "Loading $OllamaModel into memory (keep_alive: forever)..."
+try {
+    Invoke-RestMethod -Method Post -Uri "http://127.0.0.1:$OllamaPort/api/generate" -ContentType "application/json" `
+        -Body (@{ model = $OllamaModel; keep_alive = -1 } | ConvertTo-Json) -TimeoutSec 120 | Out-Null
+    Ok "model loaded and resident (will not unload)"
+} catch {
+    Warn "couldn't pre-load $OllamaModel - it will still load on its first real request, just with a one-time delay"
+}
 
 # ---------- 3. Tailscale: enroll -> join -> register ----------
 if (-not (Get-Command tailscale -ErrorAction SilentlyContinue)) {

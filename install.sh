@@ -13,20 +13,25 @@
 #      panel: Node tokens page) — interactively, or via
 #      MINICLOSEDAI_NODE_TOKEN to skip the prompt.
 #   2. Installs Ollama (official installer) and pulls the model — default
-#      qwen3.5:9b-q4_K_M, 6.6GB, chosen specifically because it fits an
-#      8GB-VRAM card with headroom (the bare qwen3.5:9b tag and the q8_0
-#      variant, at 11GB, do not). Sets OLLAMA_KEEP_ALIVE=-1 and explicitly
-#      loads the model into memory right away, so it stays resident forever
-#      instead of unloading after Ollama's default 5-minute idle timeout —
-#      the relay may route to this node unpredictably, and a cold-load on
-#      the first request after any quiet period would be bad latency.
+#      qwen3.5:4b (~3.4GB weights), chosen so the total loaded footprint
+#      stays comfortably under 6GB even with a real 32768-token context
+#      (~4.4GB total, measured) — leaving actual headroom on an 8GB card,
+#      unlike the 9b variant (6.6GB in weights alone, already over a 6GB
+#      budget before any context/overhead). Sets OLLAMA_CONTEXT_LENGTH
+#      explicitly rather than trusting Ollama's own VRAM-tiered default
+#      (which would otherwise silently land on a cramped 4096 tokens on an
+#      8GB card), OLLAMA_KEEP_ALIVE=-1, and explicitly loads the model into
+#      memory right away, so it stays resident forever instead of unloading
+#      after Ollama's default 5-minute idle timeout — the relay may route
+#      to this node unpredictably, and a cold-load on the first request
+#      after any quiet period would be bad latency.
 #   3. Asks whether to also run a local Latina voice pod (latinavoicepod) on
 #      this node — Linux only (its own start.sh assumes apt-get + a
 #      CUDA-matched torch build). Skip if this node is already tight on
-#      VRAM: qwen3.5:9b-q4_K_M plus a second GPU model competes for the
-#      same 8GB. You can add/remove a voice pod on a node later from
-#      miniaicloud's admin panel without re-running this installer, once
-#      that remote-control piece (a later phase of this project) exists.
+#      VRAM: the LLM plus a second GPU model competes for the same card.
+#      You can add/remove a voice pod on a node later from miniaicloud's
+#      admin panel without re-running this installer, once that
+#      remote-control piece (a later phase of this project) exists.
 #   4. Registers with the relay, choosing the network path automatically:
 #      - Normal box: installs Tailscale, exchanges the enrollment token for
 #        a join key via POST /api/nodes/enroll, runs `tailscale up --ssh`,
@@ -48,8 +53,9 @@
 #   MINICLOSEDAI_NODE_TOKEN   enrollment token — skips the interactive prompt
 #   MINICLOSEDAI_NODE_NAME    this node's name on the network (default: hostname)
 #   MINICLOSEDAI_NODE_VOICE   1/0 — install a local Latina voice pod (skips the prompt)
-#   OLLAMA_MODEL              model to pull (default: qwen3.5:9b-q4_K_M)
+#   OLLAMA_MODEL              model to pull (default: qwen3.5:4b)
 #   OLLAMA_PORT               port Ollama listens on (default: 11434)
+#   OLLAMA_CONTEXT_LENGTH     context window, in tokens (default: 32768)
 #   LATINA_DIR                where to clone latinavoicepod (default: $HOME/latinavoicepod)
 #   ASK_REPO                  edstui repo to pipx-install (default: git+https://github.com/edantonio505/edstui.git)
 
@@ -57,8 +63,20 @@ set -euo pipefail
 
 HUB_URL="${MINICLOSEDAI_HUB_URL:-https://app.interdataresearch.ai}"
 NODE_NAME="${MINICLOSEDAI_NODE_NAME:-$(hostname)}"
-OLLAMA_MODEL="${OLLAMA_MODEL:-qwen3.5:9b-q4_K_M}"
+# qwen3.5:4b (~3.4GB weights), not the 9b variant (~6.6GB weights alone —
+# already over a 6GB VRAM budget before adding any context/overhead). Real,
+# measured total footprint at OLLAMA_CONTEXT_LENGTH below: ~4.4GB, leaving
+# real headroom on an 8GB card instead of running it right at the edge.
+OLLAMA_MODEL="${OLLAMA_MODEL:-qwen3.5:4b}"
 OLLAMA_PORT="${OLLAMA_PORT:-11434}"
+# Ollama auto-picks a context length by detected VRAM (<24GiB -> 4096,
+# 24-48GiB -> 32768, 48GiB+ -> the model's full native context) unless told
+# otherwise — so left unset, an 8GB card would silently land on a cramped
+# 4096 tokens. Set explicitly instead: both self-documenting, and immune to
+# Ollama changing that heuristic or misdetecting VRAM later. 32768 costs
+# ~1GB of KV cache on top of the model's weights (this architecture caches
+# K/V on only 1-in-4 layers) — comfortably inside a 6GB budget with qwen3.5:4b.
+OLLAMA_CONTEXT_LENGTH="${OLLAMA_CONTEXT_LENGTH:-32768}"
 LATINA_DIR="${LATINA_DIR:-$HOME/latinavoicepod}"
 ASK_REPO="${ASK_REPO:-git+https://github.com/edantonio505/edstui.git}"
 
@@ -149,18 +167,19 @@ ollama_bound_to_all_interfaces() {
 }
 
 ensure_ollama_listens_on_all_interfaces() {
-    # OLLAMA_KEEP_ALIVE=-1 alongside the bind fix: Ollama unloads an idle
+    # Alongside the bind fix: OLLAMA_KEEP_ALIVE=-1 (Ollama unloads an idle
     # model after 5 minutes by default, which would mean the first request
     # to this node after any quiet period pays a multi-second cold-load
-    # penalty — bad for a node meant to answer relay traffic on demand.
-    # -1 means never unload once loaded.
+    # penalty — bad for a node meant to answer relay traffic on demand), and
+    # OLLAMA_CONTEXT_LENGTH set explicitly rather than left to Ollama's own
+    # VRAM-tiered auto-default (see the OLLAMA_CONTEXT_LENGTH comment above).
     if command -v systemctl >/dev/null 2>&1 \
         && [ "$(systemctl show -p LoadState --value ollama.service 2>/dev/null)" = "loaded" ]; then
         local override_dir=/etc/systemd/system/ollama.service.d
-        say "Configuring Ollama to listen on all interfaces and keep the model loaded forever…"
+        say "Configuring Ollama to listen on all interfaces, keep the model loaded forever, and use a ${OLLAMA_CONTEXT_LENGTH}-token context…"
         $SUDO mkdir -p "$override_dir"
-        printf '[Service]\nEnvironment="OLLAMA_HOST=0.0.0.0:%s"\nEnvironment="OLLAMA_KEEP_ALIVE=-1"\n' \
-            "$OLLAMA_PORT" | $SUDO tee "$override_dir/override.conf" >/dev/null
+        printf '[Service]\nEnvironment="OLLAMA_HOST=0.0.0.0:%s"\nEnvironment="OLLAMA_KEEP_ALIVE=-1"\nEnvironment="OLLAMA_CONTEXT_LENGTH=%s"\n' \
+            "$OLLAMA_PORT" "$OLLAMA_CONTEXT_LENGTH" | $SUDO tee "$override_dir/override.conf" >/dev/null
         $SUDO systemctl daemon-reload
         $SUDO systemctl restart ollama
         sleep 1
@@ -195,7 +214,8 @@ ensure_ollama_listens_on_all_interfaces() {
         # needs OLLAMA_HOST set and a manual restart for this to take effect.
         export OLLAMA_HOST="0.0.0.0:${OLLAMA_PORT}"
         export OLLAMA_KEEP_ALIVE=-1
-        warn "No systemd-managed ollama.service found — if Ollama is already running some other way, set OLLAMA_HOST=0.0.0.0:${OLLAMA_PORT} and OLLAMA_KEEP_ALIVE=-1 and restart it manually."
+        export OLLAMA_CONTEXT_LENGTH
+        warn "No systemd-managed ollama.service found — if Ollama is already running some other way, set OLLAMA_HOST=0.0.0.0:${OLLAMA_PORT}, OLLAMA_KEEP_ALIVE=-1, and OLLAMA_CONTEXT_LENGTH=${OLLAMA_CONTEXT_LENGTH}, then restart it manually."
     fi
 }
 ensure_ollama_listens_on_all_interfaces
@@ -203,7 +223,8 @@ ensure_ollama_listens_on_all_interfaces
 # Make sure something is actually listening before we try to pull.
 if ! curl -sf -m 2 "http://127.0.0.1:${OLLAMA_PORT}/api/tags" >/dev/null 2>&1; then
     say "Starting Ollama…"
-    OLLAMA_HOST="0.0.0.0:${OLLAMA_PORT}" OLLAMA_KEEP_ALIVE=-1 nohup ollama serve >/tmp/miniclosedai-node-ollama.log 2>&1 &
+    OLLAMA_HOST="0.0.0.0:${OLLAMA_PORT}" OLLAMA_KEEP_ALIVE=-1 OLLAMA_CONTEXT_LENGTH="${OLLAMA_CONTEXT_LENGTH}" \
+        nohup ollama serve >/tmp/miniclosedai-node-ollama.log 2>&1 &
     disown
     for _ in $(seq 1 20); do
         sleep 0.5
@@ -221,7 +242,7 @@ curl -sf -m 2 "http://127.0.0.1:${OLLAMA_PORT}/api/tags" >/dev/null 2>&1 \
 ollama_bound_to_all_interfaces \
     || fail "Ollama is not listening on all interfaces — the relay would not be able to reach this node. Refusing to register a backend that's known to be broken."
 
-say "Pulling ${OLLAMA_MODEL} (fits an 8GB card with headroom)…"
+say "Pulling ${OLLAMA_MODEL} (comfortably under a 6GB VRAM budget with room to spare)…"
 ollama pull "$OLLAMA_MODEL"
 ok "model ready: $OLLAMA_MODEL"
 
