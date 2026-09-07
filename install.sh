@@ -122,6 +122,24 @@ fi
 # override.conf on disk with the daemon never actually reloaded/restarted
 # against it, so a "does the file already look right, skip re-applying"
 # shortcut would have kept re-registering a still-broken node every time.
+# Real check of what's actually bound, not what's configured — a unit's
+# Environment can be correct while a stray, non-systemd `ollama serve`
+# process from an earlier attempt (e.g. this script's own fallback further
+# down, left running from a previous partial/interrupted run) still holds
+# the port on 127.0.0.1. systemd then fails to rebind 0.0.0.0 (address
+# already in use) while `systemctl restart` still reports success and the
+# unit's configured Environment still looks correct — the exact trap that
+# made `systemctl show -p Environment` alone an unreliable signal.
+ollama_bound_to_all_interfaces() {
+    command -v ss >/dev/null 2>&1 || return 0  # can't check — assume fine
+    local bound
+    bound="$(ss -ltn "sport = :${OLLAMA_PORT}" 2>/dev/null | tail -n +2)"
+    case "$bound" in
+        *"0.0.0.0:${OLLAMA_PORT}"*|*"*:${OLLAMA_PORT}"*|*":::${OLLAMA_PORT}"*) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
 ensure_ollama_listens_on_all_interfaces() {
     local desired="OLLAMA_HOST=0.0.0.0:${OLLAMA_PORT}"
     if command -v systemctl >/dev/null 2>&1 \
@@ -133,12 +151,29 @@ ensure_ollama_listens_on_all_interfaces() {
         $SUDO systemctl daemon-reload
         $SUDO systemctl restart ollama
         sleep 1
-        local applied
-        applied="$(systemctl show -p Environment --value ollama.service 2>/dev/null)"
-        case "$applied" in
-            *"OLLAMA_HOST=0.0.0.0"*) ok "systemd override applied: $applied" ;;
-            *) fail "systemd override didn't take — 'systemctl show ollama.service -p Environment' shows: ${applied:-<empty>}. Check for a competing unit (systemctl list-units '*ollama*') or a user-level override, then re-run." ;;
-        esac
+
+        if ! ollama_bound_to_all_interfaces; then
+            # Restart "succeeded" but the port is still held by loopback-only
+            # — almost always a stray process outside systemd's control.
+            # Find and stop whatever's actually holding the port, then retry
+            # once before giving up with real diagnostics.
+            say "Still bound to loopback after restart — checking for a stray process holding the port…"
+            STRAY_PID="$($SUDO ss -ltnp "sport = :${OLLAMA_PORT}" 2>/dev/null | grep -oP 'pid=\K[0-9]+' | head -1)"
+            if [ -n "${STRAY_PID:-}" ]; then
+                say "Stopping stray process (pid $STRAY_PID) and restarting Ollama…"
+                $SUDO kill "$STRAY_PID" 2>/dev/null || true
+                sleep 1
+                $SUDO systemctl restart ollama
+                sleep 1
+            fi
+        fi
+
+        if ! ollama_bound_to_all_interfaces; then
+            local active
+            active="$(systemctl is-active ollama.service 2>/dev/null || true)"
+            fail "Ollama still isn't listening on 0.0.0.0:${OLLAMA_PORT} after a clean restart (service is '${active:-unknown}'). Its configured Environment can look correct even when the process itself failed to (re)bind — check the real error with: sudo journalctl -u ollama -n 30 --no-pager"
+        fi
+        ok "Ollama confirmed listening on all interfaces (:${OLLAMA_PORT})"
     else
         # No systemd-managed ollama.service (macOS, a non-systemd Linux, or
         # Ollama running some other way entirely) — best effort: export for
@@ -165,18 +200,12 @@ curl -sf -m 2 "http://127.0.0.1:${OLLAMA_PORT}/api/tags" >/dev/null 2>&1 \
     || fail "Ollama isn't answering on :${OLLAMA_PORT} — check /tmp/miniclosedai-node-ollama.log"
 
 # The check above only proves localhost reachability — 127.0.0.1-only
-# binding (the exact bug this whole function exists to prevent) would pass
-# it too. This is the real test: confirm the listening socket itself is on
-# all interfaces before ever proceeding to register with the relay.
-if command -v ss >/dev/null 2>&1; then
-    BOUND="$(ss -ltn "sport = :${OLLAMA_PORT}" 2>/dev/null | tail -n +2)"
-    case "$BOUND" in
-        *"0.0.0.0:${OLLAMA_PORT}"*|*"*:${OLLAMA_PORT}"*|*":::${OLLAMA_PORT}"*)
-            ok "Ollama confirmed listening on all interfaces (:${OLLAMA_PORT})" ;;
-        *)
-            fail "Ollama is only reachable on: ${BOUND:-<nothing found on that port>} — expected 0.0.0.0:${OLLAMA_PORT}. The relay would not be able to reach this node; refusing to register a backend that's known to be broken." ;;
-    esac
-fi
+# binding would pass it too. Confirm the listening socket itself is on all
+# interfaces before ever proceeding — this covers the non-systemd fallback
+# path just above; the systemd path already verified this for real inside
+# ensure_ollama_listens_on_all_interfaces.
+ollama_bound_to_all_interfaces \
+    || fail "Ollama is not listening on all interfaces — the relay would not be able to reach this node. Refusing to register a backend that's known to be broken."
 
 say "Pulling ${OLLAMA_MODEL} (fits an 8GB card with headroom)…"
 ollama pull "$OLLAMA_MODEL"

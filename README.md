@@ -65,6 +65,25 @@ already set — useful for a non-interactive/scripted install.
 | `LATINA_DIR` | `$HOME/latinavoicepod` | where to clone latinavoicepod (Linux only) |
 | `ASK_REPO` | `git+https://github.com/edantonio505/edstui.git` | override for forks |
 
+## Re-running on the same machine
+
+`install.sh` is safe to re-run, but a machine that's already been enrolled
+once accumulates state (a Tailscale device identity, a systemd bind
+override, possibly a stray leftover Ollama process) that can make a second
+attempt behave unpredictably while debugging. To get a genuinely clean
+slate on a machine you've already run this on — without reinstalling Ollama
+or re-downloading the model — run:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/edantonio505/miniclosedai-node/main/reset.sh | bash
+```
+
+This leaves the tailnet (`tailscale down` + `logout`) and removes the Ollama
+bind override, so the next `install.sh` run starts from scratch on those
+two fronts. It doesn't delete the old backend row from miniaicloud — do
+that from the admin Backends page so you're not left with a confusing
+stale duplicate next to the new one.
+
 ## Why two scripts, not one
 
 A true single polyglot file that runs correctly under both `bash` and
