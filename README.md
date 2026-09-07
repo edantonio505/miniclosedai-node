@@ -21,18 +21,29 @@ as much of a small card's VRAM as possible for the model itself.
 3. *(Linux only)* Optionally installs a local **Latina voice pod**
    ([latinavoicepod](https://github.com/edantonio505/latinavoicepod)) —
    asked interactively, since it competes with the LLM for the same VRAM.
-4. Installs **Tailscale**, exchanges the enrollment token for a join key via
-   miniaicloud's `POST /api/nodes/enroll`, joins with Tailscale's own SSH
-   feature enabled (`tailscale up --ssh`) — no separate SSH keypair to
-   generate or distribute — then reports this node's tailnet IP back via
-   `POST /api/nodes/register` to become an **enabled** backend on the
-   network immediately.
+4. Registers with the relay, picking the network path automatically:
+   - **Normal box:** installs **Tailscale**, exchanges the enrollment token
+     for a join key via miniaicloud's `POST /api/nodes/enroll`, joins with
+     Tailscale's own SSH feature enabled (`tailscale up --ssh`) — no
+     separate SSH keypair to generate or distribute — then reports this
+     node's tailnet IP via `POST /api/nodes/register` to become an
+     **enabled** backend on the network immediately. Once enrolled, the
+     admin can SSH straight to the node from anywhere
+     (`tailscale ssh <node-name>`), and lock it out — disabling it and
+     removing it from the tailnet in one action — from miniaicloud's
+     Backends page.
+   - **RunPod pod** (auto-detected via `$RUNPOD_POD_ID`, which every pod has
+     set): skips Tailscale entirely and registers directly with the pod's
+     own RunPod proxy URL (`https://<pod-id>-<port>.proxy.runpod.net`).
+     RunPod pods have no `/dev/net/tun` access, so Tailscale can't provide
+     real inbound reachability there — the daemon either refuses to start
+     or falls back to userspace-networking mode, which only supports
+     outbound connections. SSH access for these nodes is RunPod's own
+     (dashboard/CLI), not Tailscale SSH — the admin's "Lock" button in
+     miniaicloud still works (it just disables the backend row; there's no
+     Tailscale device to remove for a node that never joined one).
 5. Installs the **`ask`** CLI ([edstui](https://github.com/edantonio505/edstui))
    via pipx.
-
-Once enrolled, the admin can SSH straight to the node from anywhere
-(`tailscale ssh <node-name>`), and lock it out — disabling it and removing
-it from the tailnet in one action — from miniaicloud's Backends page.
 
 ## Install
 

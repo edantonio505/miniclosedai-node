@@ -27,14 +27,18 @@
 #      same 8GB. You can add/remove a voice pod on a node later from
 #      miniaicloud's admin panel without re-running this installer, once
 #      that remote-control piece (a later phase of this project) exists.
-#   4. Installs Tailscale, exchanges the enrollment token for a join key via
-#      miniaicloud's POST /api/nodes/enroll, runs `tailscale up --ssh`, then
-#      reports this node's tailnet IP back via POST /api/nodes/register —
-#      the node is enabled on the interdata network immediately, no extra
-#      manual admin-approval step (the enrollment token itself is the trust
-#      gate). The admin can SSH straight to this node's tailnet IP from
-#      anywhere afterward, and lock it out (disable + remove from the
-#      tailnet in one action) from miniaicloud's Backends page.
+#   4. Registers with the relay, choosing the network path automatically:
+#      - Normal box: installs Tailscale, exchanges the enrollment token for
+#        a join key via POST /api/nodes/enroll, runs `tailscale up --ssh`,
+#        then reports its tailnet IP via POST /api/nodes/register — enabled
+#        immediately, no manual admin-approval step. The admin can then SSH
+#        straight to it from anywhere, and lock it out (disable + remove
+#        from the tailnet in one action) from miniaicloud's Backends page.
+#      - RunPod pod (detected via $RUNPOD_POD_ID): skips Tailscale entirely
+#        — pods have no /dev/net/tun access, so tailscaled can't do inbound
+#        reachability there — and registers directly with the pod's own
+#        RunPod proxy URL instead. SSH access for these nodes is RunPod's
+#        own (dashboard/CLI), not Tailscale SSH.
 #   5. Installs the `ask` CLI (edstui) via pipx — same pattern as
 #      miniclosedai's own installer.
 #
@@ -276,22 +280,6 @@ if [ "$WANT_VOICE" = "1" ]; then
     fi
 fi
 
-# ---------- 4. Tailscale: enroll -> join -> register ----------
-if ! command -v tailscale >/dev/null 2>&1; then
-    say "Installing Tailscale…"
-    if [ "$OS" = "Darwin" ] && command -v brew >/dev/null 2>&1; then
-        # Homebrew's tailscaled runs as a real launchd system service, unlike
-        # the App Store GUI app — the one that actually works headless.
-        brew install tailscale
-        sudo brew services start tailscale
-    else
-        curl -fsSL https://tailscale.com/install.sh | sh
-    fi
-    ok "Tailscale installed"
-else
-    ok "Tailscale already installed"
-fi
-
 # POST $1=path $2=json-body. Prints the response body on 2xx; on any other
 # status, fails with the actual HTTP status + response body — a bad token
 # (401), Tailscale not yet configured on the hub (503), or a stale deploy
@@ -309,50 +297,100 @@ hub_post() {
     printf '%s' "$resp"
 }
 
-say "Requesting a Tailscale join key from $HUB_URL…"
-ENROLL_RESP="$(hub_post /api/nodes/enroll "{\"token\":\"$TOKEN\"}")"
-AUTHKEY="$(printf '%s' "$ENROLL_RESP" | python3 -c 'import json,sys; print(json.load(sys.stdin)["tailscale_authkey"])')"
-[ -n "$AUTHKEY" ] || fail "Hub didn't return a Tailscale auth key: $ENROLL_RESP"
+# ---------- 4. Network path: RunPod proxy, or Tailscale ----------
+# RunPod sets RUNPOD_POD_ID inside every pod — reliable, no guessing needed
+# (the same signal latinavoicepod's own /api/connect-info already keys off
+# of). RunPod pods can't use Tailscale for inbound reachability: they have
+# no /dev/net/tun access (blocked since runc v1.2), so `tailscaled` either
+# refuses to start or falls back to userspace-networking mode, which only
+# supports outbound connections — the relay could never connect INTO the
+# pod at a tailnet address. A RunPod node instead registers directly with
+# its own RunPod proxy URL, skipping Tailscale (and /enroll, which only
+# exists to hand out a Tailscale join key) entirely.
+if [ -n "${RUNPOD_POD_ID:-}" ]; then
+    say "RunPod pod detected (${RUNPOD_POD_ID}) — using its proxy URL instead of Tailscale."
+    NODE_BASE_URL="https://${RUNPOD_POD_ID}-${OLLAMA_PORT}.proxy.runpod.net"
 
-say "Joining the tailnet (this also enables Tailscale SSH — no separate keys to manage)…"
-$SUDO tailscale up --authkey="$AUTHKEY" --ssh --hostname="$NODE_NAME" --accept-routes
-ok "joined the tailnet as $NODE_NAME"
+    # Best-effort only, not fatal: a pod curling its own external proxy
+    # hostname can hit hairpin-NAT quirks that don't reflect whether the
+    # RELAY (a genuinely separate host) can reach it — which is what
+    # actually matters. Warn rather than block registration on an
+    # inconclusive local test; verify for real from miniaicloud's admin
+    # "Test" button after registering.
+    say "Best-effort check of ${NODE_BASE_URL} (may be inconclusive from inside the pod itself)…"
+    if curl -sf -m 10 "${NODE_BASE_URL}/api/tags" >/dev/null 2>&1; then
+        ok "proxy URL answered from inside the pod"
+    else
+        warn "no answer from inside the pod (common hairpin-NAT false negative) — verify with the Test button on miniaicloud's Backends page after registering"
+    fi
 
-TS_IP=""
-for _ in $(seq 1 10); do
-    TS_IP="$($SUDO tailscale ip -4 2>/dev/null || true)"
-    [ -n "$TS_IP" ] && break
-    sleep 1
-done
-[ -n "$TS_IP" ] || fail "Joined the tailnet but couldn't read this node's IP (tailscale ip -4)."
-ok "tailnet IP: $TS_IP"
+    say "Registering with $HUB_URL as an enabled backend…"
+    REGISTER_RESP="$(hub_post /api/nodes/register "{\"token\":\"$TOKEN\",\"name\":\"$NODE_NAME\",\"base_url\":\"$NODE_BASE_URL\"}")"
+    ok "registered: $REGISTER_RESP"
+    SSH_NOTE="RunPod node — use RunPod's own SSH access (dashboard/CLI), not Tailscale SSH."
+else
+    if ! command -v tailscale >/dev/null 2>&1; then
+        say "Installing Tailscale…"
+        if [ "$OS" = "Darwin" ] && command -v brew >/dev/null 2>&1; then
+            # Homebrew's tailscaled runs as a real launchd system service,
+            # unlike the App Store GUI app — the one that actually works headless.
+            brew install tailscale
+            sudo brew services start tailscale
+        else
+            curl -fsSL https://tailscale.com/install.sh | sh
+        fi
+        ok "Tailscale installed"
+    else
+        ok "Tailscale already installed"
+    fi
 
-# A host firewall commonly permits loopback but blocks inbound connections
-# on tailscale0 — invisible to both the earlier `ss` bind check and a plain
-# `curl 127.0.0.1` test, but exactly what would leave a node "ejected" even
-# though Ollama is correctly bound to all interfaces. Open it proactively
-# where ufw is in play; best-effort, not fatal if ufw isn't used at all.
-if command -v ufw >/dev/null 2>&1 && $SUDO ufw status 2>/dev/null | grep -q "^Status: active"; then
-    say "Opening :${OLLAMA_PORT} for the tailscale0 interface (ufw is active)…"
-    $SUDO ufw allow in on tailscale0 to any port "$OLLAMA_PORT" proto tcp comment 'miniclosedai-node: relay access' >/dev/null
-    ok "ufw rule added for tailscale0:${OLLAMA_PORT}"
+    say "Requesting a Tailscale join key from $HUB_URL…"
+    ENROLL_RESP="$(hub_post /api/nodes/enroll "{\"token\":\"$TOKEN\"}")"
+    AUTHKEY="$(printf '%s' "$ENROLL_RESP" | python3 -c 'import json,sys; print(json.load(sys.stdin)["tailscale_authkey"])')"
+    [ -n "$AUTHKEY" ] || fail "Hub didn't return a Tailscale auth key: $ENROLL_RESP"
+
+    say "Joining the tailnet (this also enables Tailscale SSH — no separate keys to manage)…"
+    $SUDO tailscale up --authkey="$AUTHKEY" --ssh --hostname="$NODE_NAME" --accept-routes
+    ok "joined the tailnet as $NODE_NAME"
+
+    TS_IP=""
+    for _ in $(seq 1 10); do
+        TS_IP="$($SUDO tailscale ip -4 2>/dev/null || true)"
+        [ -n "$TS_IP" ] && break
+        sleep 1
+    done
+    [ -n "$TS_IP" ] || fail "Joined the tailnet but couldn't read this node's IP (tailscale ip -4)."
+    ok "tailnet IP: $TS_IP"
+
+    # A host firewall commonly permits loopback but blocks inbound connections
+    # on tailscale0 — invisible to both the earlier `ss` bind check and a plain
+    # `curl 127.0.0.1` test, but exactly what would leave a node "ejected" even
+    # though Ollama is correctly bound to all interfaces. Open it proactively
+    # where ufw is in play; best-effort, not fatal if ufw isn't used at all.
+    if command -v ufw >/dev/null 2>&1 && $SUDO ufw status 2>/dev/null | grep -q "^Status: active"; then
+        say "Opening :${OLLAMA_PORT} for the tailscale0 interface (ufw is active)…"
+        $SUDO ufw allow in on tailscale0 to any port "$OLLAMA_PORT" proto tcp comment 'miniclosedai-node: relay access' >/dev/null
+        ok "ufw rule added for tailscale0:${OLLAMA_PORT}"
+    fi
+
+    # The definitive test: curl this node's OWN tailnet address, not loopback
+    # — the exact address:port the relay's health probe will use. SSH working
+    # is NOT evidence this works: Tailscale SSH is authorized through its own
+    # separate `ssh` ACL policy, independent of the general `acls` rules that
+    # govern reachability to every other port. Refuse to register a backend
+    # with the relay until this has actually been proven over the real path,
+    # rather than finding out afterward from miniaicloud's side.
+    say "Verifying the node is reachable at its tailnet address (the same path the relay will use)…"
+    curl -sf -m 5 "http://${TS_IP}:${OLLAMA_PORT}/api/tags" >/dev/null 2>&1 \
+        || fail "Ollama's bind was already confirmed correct (0.0.0.0:${OLLAMA_PORT}, via ss), but $TS_IP:${OLLAMA_PORT} still refuses a connection from this same machine — almost certainly a firewall (ufw/iptables) blocking the tailscale0 interface, not an Ollama config problem. Check 'sudo ufw status' / 'sudo iptables -L -n', allow inbound :${OLLAMA_PORT} on tailscale0, then re-run."
+    ok "confirmed reachable at ${TS_IP}:${OLLAMA_PORT} — the same address the relay will probe"
+
+    say "Registering with $HUB_URL as an enabled backend…"
+    REGISTER_RESP="$(hub_post /api/nodes/register "{\"token\":\"$TOKEN\",\"name\":\"$NODE_NAME\",\"base_url\":\"http://${TS_IP}:${OLLAMA_PORT}\"}")"
+    ok "registered: $REGISTER_RESP"
+    NODE_BASE_URL="http://${TS_IP}:${OLLAMA_PORT}"
+    SSH_NOTE="Admin can now SSH in with: tailscale ssh $NODE_NAME"
 fi
-
-# The definitive test: curl this node's OWN tailnet address, not loopback —
-# the exact address:port the relay's health probe will use. SSH working is
-# NOT evidence this works: Tailscale SSH is authorized through its own
-# separate `ssh` ACL policy, independent of the general `acls` rules that
-# govern reachability to every other port. Refuse to register a backend
-# with the relay until this has actually been proven over the real path,
-# rather than finding out afterward from miniaicloud's side.
-say "Verifying the node is reachable at its tailnet address (the same path the relay will use)…"
-curl -sf -m 5 "http://${TS_IP}:${OLLAMA_PORT}/api/tags" >/dev/null 2>&1 \
-    || fail "Ollama's bind was already confirmed correct (0.0.0.0:${OLLAMA_PORT}, via ss), but $TS_IP:${OLLAMA_PORT} still refuses a connection from this same machine — almost certainly a firewall (ufw/iptables) blocking the tailscale0 interface, not an Ollama config problem. Check 'sudo ufw status' / 'sudo iptables -L -n', allow inbound :${OLLAMA_PORT} on tailscale0, then re-run."
-ok "confirmed reachable at ${TS_IP}:${OLLAMA_PORT} — the same address the relay will probe"
-
-say "Registering with $HUB_URL as an enabled backend…"
-REGISTER_RESP="$(hub_post /api/nodes/register "{\"token\":\"$TOKEN\",\"name\":\"$NODE_NAME\",\"tailscale_ip\":\"$TS_IP\",\"ollama_port\":$OLLAMA_PORT}")"
-ok "registered: $REGISTER_RESP"
 
 # ---------- 5. ask (edstui) ----------
 # `pip install --user pipx` alone fails outright on modern Debian/Ubuntu
@@ -384,5 +422,5 @@ fi
 
 echo
 printf '%s%s✓ Node enrolled on the interdata network%s\n' "$BOLD" "$GREEN" "$RST"
-printf '  tailnet IP: %s   model: %s\n' "$TS_IP" "$OLLAMA_MODEL"
-printf '  Admin can now SSH in with: tailscale ssh %s\n' "$NODE_NAME"
+printf '  address: %s   model: %s\n' "$NODE_BASE_URL" "$OLLAMA_MODEL"
+printf '  %s\n' "$SSH_NOTE"
