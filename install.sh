@@ -547,7 +547,7 @@ else
         ok "Tailscale already installed"
     fi
 
-    say "Requesting a Tailscale join key from $HUB_URL…"
+    say "Requesting a Tailscale join key from ${HUB_URL}…"
     ENROLL_RESP="$(hub_post /api/nodes/enroll "{\"token\":\"$TOKEN\"}")"
     AUTHKEY="$(printf '%s' "$ENROLL_RESP" | python3 -c 'import json,sys; print(json.load(sys.stdin)["tailscale_authkey"])')"
     [ -n "$AUTHKEY" ] || fail "Hub didn't return a Tailscale auth key: $ENROLL_RESP"
