@@ -13,18 +13,25 @@
 #      panel: Node tokens page) — interactively, or via
 #      MINICLOSEDAI_NODE_TOKEN to skip the prompt.
 #   2. Installs Ollama (official installer) and pulls the model — default
-#      qwen3.5:4b (~3.4GB weights), chosen so the total loaded footprint
-#      stays comfortably under 6GB even with a real 32768-token context
-#      (~4.4GB total, measured) — leaving actual headroom on an 8GB card,
-#      unlike the 9b variant (6.6GB in weights alone, already over a 6GB
-#      budget before any context/overhead). Sets OLLAMA_CONTEXT_LENGTH
-#      explicitly rather than trusting Ollama's own VRAM-tiered default
-#      (which would otherwise silently land on a cramped 4096 tokens on an
-#      8GB card), OLLAMA_KEEP_ALIVE=-1, and explicitly loads the model into
-#      memory right away, so it stays resident forever instead of unloading
-#      after Ollama's default 5-minute idle timeout — the relay may route
-#      to this node unpredictably, and a cold-load on the first request
-#      after any quiet period would be bad latency.
+#      depends on whether a working GPU is detected (nvidia-smi):
+#        - GPU: qwen3.5:4b (~3.4GB weights), chosen so the total loaded
+#          footprint stays comfortably under 6GB even with a real
+#          32768-token context (~4.4GB total, measured) — leaving actual
+#          headroom on an 8GB card, unlike the 9b variant (6.6GB in weights
+#          alone, already over a 6GB budget before any context/overhead).
+#        - CPU-only: llama3.2:3b instead — qwen3.5's "thinking" mode burns
+#          huge numbers of tokens even on trivial prompts (measured: 123s
+#          wall time for a two-sentence question on CPU, vs. 5s for
+#          llama3.2:3b with equivalent answer quality and no reasoning
+#          overhead), which is fine on a GPU but painful on CPU alone.
+#      Either way, sets OLLAMA_CONTEXT_LENGTH explicitly rather than
+#      trusting Ollama's own VRAM-tiered default (which would otherwise
+#      silently land on a cramped 4096 tokens on an 8GB card),
+#      OLLAMA_KEEP_ALIVE=-1, and explicitly loads the model into memory
+#      right away, so it stays resident forever instead of unloading after
+#      Ollama's default 5-minute idle timeout — the relay may route to this
+#      node unpredictably, and a cold-load on the first request after any
+#      quiet period would be bad latency.
 #   3. Installs the `ask` CLI (edstui) via pipx — same pattern as
 #      miniclosedai's own installer. Deliberately done before network
 #      registration below, so a node still ends up with `ask` even if
@@ -71,7 +78,7 @@
 #   MINICLOSEDAI_NODE_TOKEN   enrollment token — skips the interactive prompt
 #   MINICLOSEDAI_NODE_NAME    this node's name on the network (default: hostname)
 #   MINICLOSEDAI_NODE_VOICE   1/0 — install a local Latina voice pod (skips the prompt)
-#   OLLAMA_MODEL              model to pull (default: qwen3.5:4b)
+#   OLLAMA_MODEL              model to pull (default: qwen3.5:4b with a GPU, llama3.2:3b without one)
 #   OLLAMA_PORT               port Ollama listens on (default: 11434)
 #   OLLAMA_CONTEXT_LENGTH     context window, in tokens (default: 32768)
 #   LATINA_DIR                where to clone latinavoicepod (default: $HOME/latinavoicepod)
@@ -87,11 +94,30 @@ set -euo pipefail
 
 HUB_URL="${MINICLOSEDAI_HUB_URL:-https://app.interdataresearch.ai}"
 NODE_NAME="${MINICLOSEDAI_NODE_NAME:-$(hostname)}"
-# qwen3.5:4b (~3.4GB weights), not the 9b variant (~6.6GB weights alone —
-# already over a 6GB VRAM budget before adding any context/overhead). Real,
-# measured total footprint at OLLAMA_CONTEXT_LENGTH below: ~4.4GB, leaving
-# real headroom on an 8GB card instead of running it right at the edge.
-OLLAMA_MODEL="${OLLAMA_MODEL:-qwen3.5:4b}"
+# qwen3.5:4b (~3.4GB weights) on a GPU box, not the 9b variant (~6.6GB
+# weights alone — already over a 6GB VRAM budget before adding any
+# context/overhead). Real, measured total footprint at OLLAMA_CONTEXT_LENGTH
+# below: ~4.4GB, leaving real headroom on an 8GB card instead of running it
+# right at the edge.
+#
+# On a CPU-only box (no working nvidia-smi), qwen3.5:4b is a bad default for
+# a different reason: this model family's "thinking" mode burns huge numbers
+# of tokens even on trivial prompts — fine on a GPU, painful on CPU (measured
+# on real hardware: 1732 tokens / 123 seconds wall time for a two-sentence
+# question, vs. llama3.2:3b's 81 tokens / 5 seconds for the same prompt, same
+# quality of answer). llama3.2:3b has no such reasoning-token overhead, is
+# smaller to download, and is well-established/well-tested in Ollama —
+# genuinely "respectable enough" for real interactive testing on CPU alone,
+# not just a pipeline-verification toy like the Docker smoke test's 0.5b pick.
+HAS_GPU=0
+command -v nvidia-smi >/dev/null 2>&1 && nvidia-smi >/dev/null 2>&1 && HAS_GPU=1
+if [ -z "${OLLAMA_MODEL:-}" ]; then
+    if [ "$HAS_GPU" = "1" ]; then
+        OLLAMA_MODEL="qwen3.5:4b"
+    else
+        OLLAMA_MODEL="llama3.2:3b"
+    fi
+fi
 OLLAMA_PORT="${OLLAMA_PORT:-11434}"
 # Ollama auto-picks a context length by detected VRAM (<24GiB -> 4096,
 # 24-48GiB -> 32768, 48GiB+ -> the model's full native context) unless told
@@ -303,7 +329,11 @@ curl -sf -m 2 "http://127.0.0.1:${OLLAMA_PORT}/api/tags" >/dev/null 2>&1 \
 ollama_bound_to_all_interfaces \
     || fail "Ollama is not listening on all interfaces — the relay would not be able to reach this node. Refusing to register a backend that's known to be broken."
 
-say "Pulling ${OLLAMA_MODEL} (comfortably under a 6GB VRAM budget with room to spare)…"
+if [ "$HAS_GPU" = "1" ]; then
+    say "Pulling ${OLLAMA_MODEL} (comfortably under a 6GB VRAM budget with room to spare)…"
+else
+    say "Pulling ${OLLAMA_MODEL} (no GPU detected — chosen to run respectably on CPU alone)…"
+fi
 ollama pull "$OLLAMA_MODEL"
 ok "model ready: $OLLAMA_MODEL"
 
