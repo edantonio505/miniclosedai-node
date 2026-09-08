@@ -191,6 +191,23 @@ try {
 Ok "registered: backend #$($register.backend_id) -> $($register.base_url)"
 
 # ---------- 4. ask (edstui) ----------
+# `pipx install git+https://...` needs git on PATH just to clone the repo —
+# without it this step fails silently on any box that doesn't already
+# happen to have git installed. Not fatal: a missing `ask` CLI shouldn't
+# block the node's actual registration, which never touches git.
+if (-not (Get-Command git -ErrorAction SilentlyContinue)) {
+    Say "Installing git (required by pipx to install the ask CLI from GitHub)..."
+    if (Get-Command winget -ErrorAction SilentlyContinue) {
+        winget install --silent --accept-package-agreements --accept-source-agreements Git.Git
+        $env:Path = "$env:ProgramFiles\Git\cmd;$env:Path"
+    }
+    if (-not (Get-Command git -ErrorAction SilentlyContinue)) {
+        Warn "couldn't install git automatically - the ask CLI install step below will fail until it's installed manually (winget install Git.Git)"
+    } else {
+        Ok "git installed"
+    }
+}
+
 $pyCmd = Get-Command python -ErrorAction SilentlyContinue
 if (-not $pyCmd) { $pyCmd = Get-Command py -ErrorAction SilentlyContinue }
 if (-not $pyCmd) {

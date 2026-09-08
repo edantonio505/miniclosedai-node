@@ -25,14 +25,18 @@
 #      after Ollama's default 5-minute idle timeout — the relay may route
 #      to this node unpredictably, and a cold-load on the first request
 #      after any quiet period would be bad latency.
-#   3. Asks whether to also run a local Latina voice pod (latinavoicepod) on
+#   3. Installs the `ask` CLI (edstui) via pipx — same pattern as
+#      miniclosedai's own installer. Deliberately done before network
+#      registration below, so a node still ends up with `ask` even if
+#      Tailscale/registration fails — useful for debugging exactly that.
+#   4. Asks whether to also run a local Latina voice pod (latinavoicepod) on
 #      this node — Linux only (its own start.sh assumes apt-get + a
 #      CUDA-matched torch build). Skip if this node is already tight on
 #      VRAM: the LLM plus a second GPU model competes for the same card.
 #      You can add/remove a voice pod on a node later from miniaicloud's
 #      admin panel without re-running this installer, once that
 #      remote-control piece (a later phase of this project) exists.
-#   4. Registers with the relay, choosing the network path automatically:
+#   5. Registers with the relay, choosing the network path automatically:
 #      - Normal box: installs Tailscale, exchanges the enrollment token for
 #        a join key via POST /api/nodes/enroll, runs `tailscale up --ssh`,
 #        then reports its tailnet IP via POST /api/nodes/register — enabled
@@ -44,8 +48,6 @@
 #        reachability there — and registers directly with the pod's own
 #        RunPod proxy URL instead. SSH access for these nodes is RunPod's
 #        own (dashboard/CLI), not Tailscale SSH.
-#   5. Installs the `ask` CLI (edstui) via pipx — same pattern as
-#      miniclosedai's own installer.
 #
 # Env vars (all optional except the token, which the script will prompt for
 # if not set):
@@ -103,6 +105,38 @@ need() {
 need curl
 need python3
 
+SUDO=""; [ "$(id -u)" != "0" ] && command -v sudo >/dev/null 2>&1 && SUDO="sudo"
+
+# Best-effort auto-install for tools this script (or something it shells
+# out to) assumes exist but that aren't guaranteed present on a fresh box —
+# apt first (sidesteps needing to know the right brew formula/package name
+# case by case), brew as a macOS fallback, warn-not-fail either way, since
+# none of these should block the node's actual registration.
+ensure_tool() {
+    local bin="$1" apt_pkg="$2" brew_pkg="$3" why="$4"
+    command -v "$bin" >/dev/null 2>&1 && return 0
+    say "Installing $apt_pkg ($why)…"
+    if command -v apt-get >/dev/null 2>&1; then
+        $SUDO apt-get update -qq && $SUDO apt-get install -y -qq "$apt_pkg"
+    elif command -v brew >/dev/null 2>&1; then
+        brew install "$brew_pkg"
+    fi
+    command -v "$bin" >/dev/null 2>&1 \
+        && ok "$apt_pkg installed" \
+        || warn "couldn't install $apt_pkg automatically — install it manually, then re-run"
+}
+# `git` isn't a dependency of the `pipx` apt package, and `pipx install
+# git+https://...` needs it on PATH just to clone the repo — without it,
+# the `ask` (edstui) install step below fails silently on any box that
+# doesn't already happen to have git (this dev machine always has, which is
+# why this went uncaught here).
+ensure_tool git git git "required by pipx to install the \`ask\` CLI from GitHub"
+# Ollama's own official installer extracts a .tar.zst archive and hard-fails
+# with "This version requires zstd for extraction" if it's missing — not
+# guaranteed present either (surfaced on arm64 while building this script's
+# own Docker test harness; the same class of "assumed present" gap as git).
+ensure_tool zstd zstd zstd "required by Ollama's own installer to extract its release archive"
+
 # `curl ... | bash` (the documented one-liner) feeds this whole script in on
 # stdin, so a plain `read` here would immediately hit EOF instead of
 # prompting. Read from the controlling terminal directly instead — works
@@ -124,8 +158,6 @@ else
     TOKEN="$REPLY"
 fi
 [ -n "$TOKEN" ] || fail "An enrollment token is required — mint one in miniaicloud's admin panel first (or set MINICLOSEDAI_NODE_TOKEN, e.g. when no terminal is attached)."
-
-SUDO=""; [ "$(id -u)" != "0" ] && command -v sudo >/dev/null 2>&1 && SUDO="sudo"
 
 # ---------- 2. Ollama + model ----------
 if ! command -v ollama >/dev/null 2>&1; then
@@ -262,7 +294,39 @@ else
     warn "model doesn't show as loaded in 'ollama ps' — check 'sudo journalctl -u ollama -n 30 --no-pager' if the node responds slowly to its first request"
 fi
 
-# ---------- 3. Optional local voice pod (Linux only) ----------
+# ---------- 3. ask (edstui) ----------
+# Installed here, before network registration, so a node still ends up with
+# `ask` even if Tailscale/registration fails further down — this used to
+# run last, so a registration hiccup meant the script never reached it at
+# all, compounding the very problem `ask` would help debug.
+# `pip install --user pipx` alone fails outright on modern Debian/Ubuntu
+# (PEP 668 "externally managed environment") unless --break-system-packages
+# is passed or apt is used instead — and a bare `|| warn` here would swallow
+# that failure silently, so pipx (and therefore `ask`) would never actually
+# get installed. Try apt first (Debian/Ubuntu's own recommended path,
+# sidesteps PEP 668 entirely), then pip with the override flag, then plain
+# pip for older systems that predate PEP 668 altogether.
+if ! command -v pipx >/dev/null 2>&1; then
+    say "Installing pipx (for the \`ask\` CLI)…"
+    if command -v apt-get >/dev/null 2>&1; then
+        $SUDO apt-get update -qq && $SUDO apt-get install -y -qq pipx
+    fi
+    if ! command -v pipx >/dev/null 2>&1; then
+        python3 -m pip install -q --user pipx --break-system-packages 2>/dev/null \
+            || python3 -m pip install -q --user pipx
+    fi
+    python3 -m pipx ensurepath >/dev/null 2>&1 || true
+    export PATH="$HOME/.local/bin:$PATH"
+fi
+if command -v pipx >/dev/null 2>&1; then
+    say "Installing the \`ask\` CLI (edstui)…"
+    pipx install --quiet --force "$ASK_REPO" && ok "ask CLI ready — run \`ask\` from any shell" \
+        || warn "pipx install of $ASK_REPO failed (network?) — re-run later: pipx install --force $ASK_REPO"
+else
+    warn "pipx still isn't installed after apt/pip attempts — \`ask\` was skipped. Install pipx manually, then: pipx install --force $ASK_REPO"
+fi
+
+# ---------- 4. Optional local voice pod (Linux only) ----------
 if [ -n "${MINICLOSEDAI_NODE_VOICE:-}" ]; then
     WANT_VOICE="$MINICLOSEDAI_NODE_VOICE"
 else
@@ -318,7 +382,7 @@ hub_post() {
     printf '%s' "$resp"
 }
 
-# ---------- 4. Network path: RunPod proxy, or Tailscale ----------
+# ---------- 5. Network path: RunPod proxy, or Tailscale ----------
 # RunPod sets RUNPOD_POD_ID inside every pod — reliable, no guessing needed
 # (the same signal latinavoicepod's own /api/connect-info already keys off
 # of). RunPod pods can't use Tailscale for inbound reachability: they have
@@ -411,34 +475,6 @@ else
     ok "registered: $REGISTER_RESP"
     NODE_BASE_URL="http://${TS_IP}:${OLLAMA_PORT}"
     SSH_NOTE="Admin can now SSH in with: tailscale ssh $NODE_NAME"
-fi
-
-# ---------- 5. ask (edstui) ----------
-# `pip install --user pipx` alone fails outright on modern Debian/Ubuntu
-# (PEP 668 "externally managed environment") unless --break-system-packages
-# is passed or apt is used instead — and the old `|| warn` here swallowed
-# that failure silently, so pipx (and therefore `ask`) never actually got
-# installed. Try apt first (Debian/Ubuntu's own recommended path, sidesteps
-# PEP 668 entirely), then pip with the override flag, then plain pip for
-# older systems that predate PEP 668 altogether.
-if ! command -v pipx >/dev/null 2>&1; then
-    say "Installing pipx (for the \`ask\` CLI)…"
-    if command -v apt-get >/dev/null 2>&1; then
-        $SUDO apt-get update -qq && $SUDO apt-get install -y -qq pipx
-    fi
-    if ! command -v pipx >/dev/null 2>&1; then
-        python3 -m pip install -q --user pipx --break-system-packages 2>/dev/null \
-            || python3 -m pip install -q --user pipx
-    fi
-    python3 -m pipx ensurepath >/dev/null 2>&1 || true
-    export PATH="$HOME/.local/bin:$PATH"
-fi
-if command -v pipx >/dev/null 2>&1; then
-    say "Installing the \`ask\` CLI (edstui)…"
-    pipx install --quiet --force "$ASK_REPO" && ok "ask CLI ready — run \`ask\` from any shell" \
-        || warn "pipx install of $ASK_REPO failed (network?) — the node is already registered; re-run later: pipx install --force $ASK_REPO"
-else
-    warn "pipx still isn't installed after apt/pip attempts — \`ask\` was skipped. The node is already registered; install pipx manually, then: pipx install --force $ASK_REPO"
 fi
 
 echo
