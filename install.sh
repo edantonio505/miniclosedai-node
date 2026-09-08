@@ -199,7 +199,30 @@ ensure_tool zstd zstd zstd "required by Ollama's own installer to extract its re
 prompt() {
     if { : > /dev/tty; } 2>/dev/null; then
         printf '%s' "$1" > /dev/tty
-        read -r REPLY < /dev/tty
+        # Bracketed paste mode — on by default in iTerm2 and modern
+        # Terminal.app — wraps a pasted string in \e[200~ ... \e[201~ so the
+        # SHELL's own line editor can tell "pasted" from "typed" input. A
+        # raw `read` here has no such editor and does not strip those
+        # markers, so a pasted secret comes back with literal escape bytes
+        # stuck to it — this is the real mechanism behind "the terminal
+        # breaks whenever I paste something with a dash in it" (every token
+        # on this network happens to contain '-'/'_', so that's what got
+        # blamed, but any pasted value would have hit the same corruption).
+        # Disable it for the read, then strip the markers anyway in case the
+        # terminal had already queued the wrapped bytes before the disable
+        # took effect.
+        printf '\e[?2004l' > /dev/tty 2>/dev/null || true
+        IFS= read -r REPLY < /dev/tty
+        printf '\e[?2004h' > /dev/tty 2>/dev/null || true
+        REPLY="${REPLY//$'\e'\[200~/}"
+        REPLY="${REPLY//$'\e'\[201~/}"
+        REPLY="${REPLY//$'\r'/}"
+        # `IFS= read` (needed above so a real leading/trailing space in a
+        # pasted value survives) also disables plain `read`'s usual
+        # leading/trailing-whitespace trim — restore just that part, since a
+        # trailing space/newline is a common copy-button artifact.
+        REPLY="${REPLY#"${REPLY%%[![:space:]]*}"}"
+        REPLY="${REPLY%"${REPLY##*[![:space:]]}"}"
     else
         REPLY=""
     fi
