@@ -405,8 +405,17 @@ if command -v ask >/dev/null 2>&1 || command -v pipx >/dev/null 2>&1; then
         BASH_ALIASES_FILE="$HOME/.bash_aliases"
         touch "$BASH_ALIASES_FILE"
         # Idempotent: drop any lines a PRIOR run of this installer added,
-        # so re-running doesn't pile up duplicate/stale exports.
-        sed -i '/^export EDS_TUI_URL=/d; /^export EDS_TUI_TOKEN=/d; /^export EDS_TUI_MODEL=/d' "$BASH_ALIASES_FILE"
+        # so re-running doesn't pile up duplicate/stale exports. `grep -v`
+        # instead of `sed -i`, deliberately — BSD sed (macOS's default)
+        # requires an explicit backup-suffix argument after -i (even an
+        # empty one, `-i ''`), while GNU sed (Linux) does not; the same
+        # invocation that works on Linux fails on macOS with a cryptic
+        # "sed: 1: ... : i" error, since BSD sed then misreads the script
+        # itself as that suffix and the target file as the script. grep -v
+        # has no such split and is identical on both.
+        grep -vE '^export (EDS_TUI_URL|EDS_TUI_TOKEN|EDS_TUI_MODEL)=' "$BASH_ALIASES_FILE" \
+            > "$BASH_ALIASES_FILE.tmp" || true
+        mv "$BASH_ALIASES_FILE.tmp" "$BASH_ALIASES_FILE"
         {
             printf 'export EDS_TUI_URL=%q\n' "$HUB_URL"
             printf 'export EDS_TUI_TOKEN=%q\n' "$ASK_API_KEY"
