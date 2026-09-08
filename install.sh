@@ -488,28 +488,40 @@ if command -v ask >/dev/null 2>&1 || command -v pipx >/dev/null 2>&1; then
         ASK_API_KEY="$REPLY"
     fi
     if [ -n "$ASK_API_KEY" ]; then
-        BASH_ALIASES_FILE="$HOME/.bash_aliases"
-        touch "$BASH_ALIASES_FILE"
-        # Idempotent: drop any lines a PRIOR run of this installer added,
-        # so re-running doesn't pile up duplicate/stale exports. `grep -v`
-        # instead of `sed -i`, deliberately — BSD sed (macOS's default)
-        # requires an explicit backup-suffix argument after -i (even an
-        # empty one, `-i ''`), while GNU sed (Linux) does not; the same
-        # invocation that works on Linux fails on macOS with a cryptic
-        # "sed: 1: ... : i" error, since BSD sed then misreads the script
-        # itself as that suffix and the target file as the script. grep -v
-        # has no such split and is identical on both.
-        grep -vE '^export (EDS_TUI_URL|EDS_TUI_TOKEN|EDS_TUI_MODEL)=' "$BASH_ALIASES_FILE" \
-            > "$BASH_ALIASES_FILE.tmp" || true
-        mv "$BASH_ALIASES_FILE.tmp" "$BASH_ALIASES_FILE"
-        {
-            printf 'export EDS_TUI_URL=%q\n' "$HUB_URL"
-            printf 'export EDS_TUI_TOKEN=%q\n' "$ASK_API_KEY"
-            printf 'export EDS_TUI_MODEL=%q\n' "${MINICLOSEDAI_NODE_ASK_MODEL:-qwen3.8:latest}"
-        } >> "$BASH_ALIASES_FILE"
-        ok "ask configured to reach interdata directly — open a new shell (or: source ~/.bash_aliases)"
+        # Write to whatever startup file the user's NEXT shell will actually
+        # source, not just ~/.bash_aliases (a bash/Linux convention — Ubuntu's
+        # default ~/.bashrc sources it automatically). macOS has used zsh as
+        # its default login shell since Catalina, and zsh does not read
+        # ~/.bash_aliases or ~/.bashrc at all — a real Mac install wrote this
+        # config "successfully" yet `ask` kept silently falling back to
+        # edstui's own hardcoded default host, since no new Terminal window
+        # ever actually loaded it. Write both files, idempotently, so this
+        # works the same way on Mac (zsh) and Linux (bash) without needing to
+        # detect which shell the node ends up using.
+        write_ask_config() {
+            local rc_file="$1"
+            touch "$rc_file"
+            # `grep -v` instead of `sed -i`, deliberately — BSD sed (macOS's
+            # default) requires an explicit backup-suffix argument after -i
+            # (even an empty one, `-i ''`), while GNU sed (Linux) does not;
+            # the same invocation that works on Linux fails on macOS with a
+            # cryptic "sed: 1: ... : i" error, since BSD sed then misreads
+            # the script itself as that suffix and the target file as the
+            # script. grep -v has no such split and is identical on both.
+            grep -vE '^export (EDS_TUI_URL|EDS_TUI_TOKEN|EDS_TUI_MODEL)=' "$rc_file" \
+                > "$rc_file.tmp" || true
+            mv "$rc_file.tmp" "$rc_file"
+            {
+                printf 'export EDS_TUI_URL=%q\n' "$HUB_URL"
+                printf 'export EDS_TUI_TOKEN=%q\n' "$ASK_API_KEY"
+                printf 'export EDS_TUI_MODEL=%q\n' "${MINICLOSEDAI_NODE_ASK_MODEL:-qwen3.8:latest}"
+            } >> "$rc_file"
+        }
+        write_ask_config "$HOME/.bash_aliases"
+        write_ask_config "$HOME/.zshrc"
+        ok "ask configured to reach interdata directly — open a new terminal window/tab (bash or zsh) to pick it up"
     else
-        say "No relay API key given — ask is installed but not yet pointed at interdata. Configure it later by adding EDS_TUI_URL/EDS_TUI_TOKEN to ~/.bash_aliases (see miniclosedai-node's README)."
+        say "No relay API key given — ask is installed but not yet pointed at interdata. Configure it later by adding EDS_TUI_URL/EDS_TUI_TOKEN to ~/.bash_aliases (bash) and/or ~/.zshrc (zsh, macOS default) — see miniclosedai-node's README."
     fi
 fi
 
