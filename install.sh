@@ -48,6 +48,16 @@
 #        reachability there — and registers directly with the pod's own
 #        RunPod proxy URL instead. SSH access for these nodes is RunPod's
 #        own (dashboard/CLI), not Tailscale SSH.
+#   6. Asks whether to enable HuggingFace model support (skipped on RunPod —
+#      see the section itself for why). If yes: clones miniclosedai-node
+#      (for its manager/ control plane + the mcai-node CLI), sets up the
+#      manager's lightweight venv, sets up the bare-metal transformers shim
+#      engine (the one that reliably works with no Docker/vLLM setup),
+#      optionally saves a HuggingFace token, and runs the manager as a
+#      systemd service (or a background process if systemd isn't present).
+#      `mcai-node run <hf_id>` then downloads + serves any HF model; a
+#      launched model registers as a SECOND backend under this same node
+#      via `mcai-node register`, alongside its Ollama backend.
 #
 # Env vars (all optional except the token, which the script will prompt for
 # if not set):
@@ -60,6 +70,10 @@
 #   OLLAMA_CONTEXT_LENGTH     context window, in tokens (default: 32768)
 #   LATINA_DIR                where to clone latinavoicepod (default: $HOME/latinavoicepod)
 #   ASK_REPO                  edstui repo to pipx-install (default: git+https://github.com/edantonio505/edstui.git)
+#   MINICLOSEDAI_NODE_HF      1/0 — enable HuggingFace model support (skips the prompt)
+#   MINICLOSEDAI_NODE_HF_TOKEN  HuggingFace access token to save (skips the prompt)
+#   MINICLOSEDAI_NODE_REPO_DIR  where to clone miniclosedai-node itself (default: $HOME/miniclosedai-node)
+#   MINICLOSEDAI_NODE_HOME    where mcai-node keeps its local state (default: $HOME/.miniclosedai-node)
 
 set -euo pipefail
 
@@ -382,6 +396,22 @@ hub_post() {
     printf '%s' "$resp"
 }
 
+# Persist this node's interdata-network identity (node_id + node_api_key,
+# shown once in /api/nodes/register's response) so mcai-node's own `register`
+# command can later add further backends (e.g. a launched HuggingFace model)
+# under this SAME node without needing a fresh enrollment token.
+NODE_STATE_DIR="${MINICLOSEDAI_NODE_HOME:-$HOME/.miniclosedai-node}"
+save_node_state() {
+    mkdir -p "$NODE_STATE_DIR"
+    printf '%s' "$1" | python3 -c '
+import json, sys
+r = json.load(sys.stdin)
+json.dump({"node_id": r["node_id"], "node_api_key": r["node_api_key"],
+           "hub_url": "'"$HUB_URL"'"}, sys.stdout)
+' > "$NODE_STATE_DIR/node.json"
+    chmod 600 "$NODE_STATE_DIR/node.json"
+}
+
 # ---------- 5. Network path: RunPod proxy, or Tailscale ----------
 # RunPod sets RUNPOD_POD_ID inside every pod — reliable, no guessing needed
 # (the same signal latinavoicepod's own /api/connect-info already keys off
@@ -412,6 +442,7 @@ if [ -n "${RUNPOD_POD_ID:-}" ]; then
     say "Registering with $HUB_URL as an enabled backend…"
     REGISTER_RESP="$(hub_post /api/nodes/register "{\"token\":\"$TOKEN\",\"name\":\"$NODE_NAME\",\"base_url\":\"$NODE_BASE_URL\"}")"
     ok "registered: $REGISTER_RESP"
+    save_node_state "$REGISTER_RESP"
     SSH_NOTE="RunPod node — use RunPod's own SSH access (dashboard/CLI), not Tailscale SSH."
 else
     if ! command -v tailscale >/dev/null 2>&1; then
@@ -473,8 +504,117 @@ else
     say "Registering with $HUB_URL as an enabled backend…"
     REGISTER_RESP="$(hub_post /api/nodes/register "{\"token\":\"$TOKEN\",\"name\":\"$NODE_NAME\",\"base_url\":\"http://${TS_IP}:${OLLAMA_PORT}\"}")"
     ok "registered: $REGISTER_RESP"
+    save_node_state "$REGISTER_RESP"
     NODE_BASE_URL="http://${TS_IP}:${OLLAMA_PORT}"
     SSH_NOTE="Admin can now SSH in with: tailscale ssh $NODE_NAME"
+fi
+
+# ---------- 6. Optional: HuggingFace model support (mcai-node) ----------
+# Not offered on a RunPod pod: pods have no systemd (nothing to daemonize
+# the manager with) and typically no Docker daemon of their own either
+# (nested-container launches would need docker-in-docker or a mounted host
+# socket, neither of which a RunPod pod provides) — the one engine left,
+# the bare-metal transformers shim, is a reasonable fallback on a normal
+# box but not a solid default for RunPod's already-containerized model.
+if [ -z "${RUNPOD_POD_ID:-}" ]; then
+    if [ -n "${MINICLOSEDAI_NODE_HF:-}" ]; then
+        WANT_HF="$MINICLOSEDAI_NODE_HF"
+    else
+        WANT_HF=0
+        prompt 'Enable HuggingFace model support on this node (download + run arbitrary HF models via mcai-node)? [y/N] '
+        case "$REPLY" in [Yy]*) WANT_HF=1 ;; esac
+    fi
+
+    if [ "$WANT_HF" = "1" ]; then
+        NODE_REPO_DIR="${MINICLOSEDAI_NODE_REPO_DIR:-$HOME/miniclosedai-node}"
+        if [ -d "$NODE_REPO_DIR/.git" ]; then
+            say "miniclosedai-node: existing checkout — pulling"
+            git -C "$NODE_REPO_DIR" pull --quiet
+        else
+            say "Cloning miniclosedai-node (for the model manager + mcai-node CLI)…"
+            git clone --quiet https://github.com/edantonio505/miniclosedai-node.git "$NODE_REPO_DIR"
+        fi
+        MANAGER_DIR="$NODE_REPO_DIR/manager"
+
+        say "Setting up the model manager's control-plane env (lightweight — no torch/vLLM here)…"
+        python3 -m venv "$MANAGER_DIR/.venv"
+        "$MANAGER_DIR/.venv/bin/pip" install -q -r "$MANAGER_DIR/requirements.txt"
+        ok "manager control plane ready"
+
+        # PUBLIC_HOST tells the manager to advertise the SAME tailnet address
+        # its Ollama backend already registered with — the address the relay
+        # can actually reach — instead of the manager's own LAN-IP guess.
+        printf 'PUBLIC_HOST=%s\n' "$TS_IP" > "$MANAGER_DIR/.env"
+
+        if [ -n "${MINICLOSEDAI_NODE_HF_TOKEN:-}" ]; then
+            printf 'HF_TOKEN=%s\n' "$MINICLOSEDAI_NODE_HF_TOKEN" >> "$MANAGER_DIR/.env"
+        else
+            prompt 'HuggingFace access token (optional, only needed for gated models — blank to skip): '
+            [ -n "$REPLY" ] && printf 'HF_TOKEN=%s\n' "$REPLY" >> "$MANAGER_DIR/.env"
+        fi
+
+        # The shim (bare-metal transformers) is the engine that reliably works
+        # on a plain gaming PC with no Docker daemon and no pip-installed
+        # vLLM — set it up now so `mcai-node run` works immediately rather
+        # than needing a separate manual step. Best-effort: a slow/failed
+        # torch install here shouldn't fail the whole install — Ollama
+        # registration above already succeeded, which is the critical path.
+        say "Setting up the transformers shim engine (downloads torch — can take a few minutes)…"
+        ( cd "$MANAGER_DIR" && ./setup_shim.sh >/tmp/miniclosedai-node-shim-setup.log 2>&1 ) \
+            && ok "shim engine ready" \
+            || warn "shim setup didn't finish cleanly — check /tmp/miniclosedai-node-shim-setup.log. Docker (if installed) or a manual 'pip install vllm' still work as alternate engines."
+
+        say "Installing the mcai-node CLI…"
+        MCAI_NODE_BIN="/usr/local/bin/mcai-node"
+        if ! $SUDO cp "$NODE_REPO_DIR/mcai-node" "$MCAI_NODE_BIN" 2>/dev/null; then
+            mkdir -p "$HOME/.local/bin"
+            cp "$NODE_REPO_DIR/mcai-node" "$HOME/.local/bin/mcai-node"
+            MCAI_NODE_BIN="$HOME/.local/bin/mcai-node"
+            export PATH="$HOME/.local/bin:$PATH"
+        fi
+        chmod +x "$MCAI_NODE_BIN"
+        ok "mcai-node installed: $MCAI_NODE_BIN"
+
+        say "Starting the model manager…"
+        if command -v systemctl >/dev/null 2>&1 && [ "$(id -u)" = "0" -o -n "$SUDO" ]; then
+            $SUDO tee /etc/systemd/system/miniclosedai-node-manager.service >/dev/null <<EOF
+[Unit]
+Description=miniclosedai-node HuggingFace model manager
+After=network.target
+
+[Service]
+Type=simple
+User=$(id -un)
+WorkingDirectory=$MANAGER_DIR
+EnvironmentFile=$MANAGER_DIR/.env
+ExecStart=$MANAGER_DIR/.venv/bin/python $MANAGER_DIR/app.py
+Restart=on-failure
+
+[Install]
+WantedBy=multi-user.target
+EOF
+            $SUDO systemctl daemon-reload
+            $SUDO systemctl enable --now miniclosedai-node-manager
+            sleep 1
+            if systemctl is-active --quiet miniclosedai-node-manager; then
+                ok "model manager running as a systemd service (survives reboot)"
+            else
+                warn "manager service didn't come up cleanly — check: sudo journalctl -u miniclosedai-node-manager -n 30 --no-pager"
+            fi
+        else
+            # Absolute paths, deliberately — a relative "app.py" would show up
+            # in `ps`/`pkill -f` as just that (the cwd isn't visible there),
+            # which is both hard to target precisely later and exactly what
+            # broke uninstall.sh's own `pkill -f "$MANAGER_DIR/app.py"` cleanup
+            # when this was first tested.
+            ( cd "$MANAGER_DIR" && set -a && . ./.env && set +a && \
+              nohup "$MANAGER_DIR/.venv/bin/python" "$MANAGER_DIR/app.py" \
+                  >/tmp/miniclosedai-node-manager.log 2>&1 & disown )
+            warn "no systemd here — started the manager in the background, but it will NOT survive a reboot. Log: /tmp/miniclosedai-node-manager.log"
+        fi
+
+        say "  next: mcai-node run <hf_id>   (then: mcai-node register <id> to add it to the network)"
+    fi
 fi
 
 echo

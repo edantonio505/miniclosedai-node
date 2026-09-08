@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+.venv/
+.shim-venv/
+.run/
+.env
+models.local.json

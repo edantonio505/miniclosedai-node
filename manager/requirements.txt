@@ -1,0 +1,7 @@
+# Deps for the control plane (app.py + model_manager.py) ONLY. Deliberately
+# lightweight — no torch/vLLM here. The heavy ML stack runs inside whatever
+# the manager launches (a vLLM container/subprocess, or the transformers
+# shim's own venv from ./setup_shim.sh). This keeps the manager itself fast
+# to install on any node.
+fastapi>=0.110.0
+uvicorn[standard]>=0.29.0

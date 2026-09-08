@@ -4,12 +4,14 @@
 # a dirty test box can re-enroll cleanly, deliberately leaving software
 # installed), this actually uninstalls it: Ollama (+ its systemd override
 # and, with confirmation, its pulled models), Tailscale (+ leaving the
-# tailnet), the `ask` CLI (edstui, pipx package `eds-tui`), and a local
-# latinavoicepod checkout if one exists.
+# tailnet), the `ask` CLI (edstui, pipx package `eds-tui`), a local
+# latinavoicepod checkout if one exists, and — if HuggingFace model support
+# was enabled — the model manager service, its cloned repo, and the
+# mcai-node CLI.
 #
-# There's no `mcai-node` CLI yet for this to be a real subcommand of (a
-# separate, in-progress plan) — ships for now as a standalone script, same
-# pattern as install.sh/reset.sh.
+# There's no `mcai-node uninstall` subcommand for this to be part of yet (its
+# own repo is one of the things this script may be removing) — ships for now
+# as a standalone script, same pattern as install.sh/reset.sh.
 #
 # Usage:
 #   curl -fsSL https://raw.githubusercontent.com/edantonio505/miniclosedai-node/main/uninstall.sh | bash
@@ -18,11 +20,15 @@
 #   MINICLOSEDAI_UNINSTALL_MODELS   1/0 — delete pulled Ollama models too (skips the confirmation prompt)
 #   LATINA_DIR                      where latinavoicepod was cloned (default: $HOME/latinavoicepod)
 #   OLLAMA_PORT                     port Ollama listens on (default: 11434)
+#   MINICLOSEDAI_NODE_REPO_DIR      where miniclosedai-node was cloned for HF support (default: $HOME/miniclosedai-node)
+#   MINICLOSEDAI_NODE_HOME          where mcai-node's local state lives (default: $HOME/.miniclosedai-node)
 
 set -euo pipefail
 
 OLLAMA_PORT="${OLLAMA_PORT:-11434}"
 LATINA_DIR="${LATINA_DIR:-$HOME/latinavoicepod}"
+NODE_REPO_DIR="${MINICLOSEDAI_NODE_REPO_DIR:-$HOME/miniclosedai-node}"
+NODE_STATE_DIR="${MINICLOSEDAI_NODE_HOME:-$HOME/.miniclosedai-node}"
 
 if [ -t 1 ]; then
     BOLD=$'\e[1m'; GREEN=$'\e[32m'; RED=$'\e[31m'; DIM=$'\e[2m'; RST=$'\e[0m'
@@ -136,6 +142,38 @@ if command -v tailscale >/dev/null 2>&1; then
     fi
 else
     say "Tailscale not installed — nothing to remove."
+fi
+
+# ---------- 5. HuggingFace model manager (if enabled) ----------
+if command -v systemctl >/dev/null 2>&1 \
+    && systemctl list-unit-files miniclosedai-node-manager.service >/dev/null 2>&1; then
+    say "Stopping and removing the model manager service…"
+    $SUDO systemctl disable --now miniclosedai-node-manager >/dev/null 2>&1 || true
+    $SUDO rm -f /etc/systemd/system/miniclosedai-node-manager.service
+    $SUDO systemctl daemon-reload 2>/dev/null || true
+    ok "model manager service removed"
+else
+    pkill -f "$NODE_REPO_DIR/manager/app.py" 2>/dev/null || true
+fi
+
+$SUDO rm -f /usr/local/bin/mcai-node
+rm -f "$HOME/.local/bin/mcai-node"
+hash -r 2>/dev/null || true
+if command -v mcai-node >/dev/null 2>&1; then
+    warn "mcai-node still on PATH somewhere — remove it manually if you want it fully gone"
+fi
+
+if [ -d "$NODE_REPO_DIR" ]; then
+    say "Removing $NODE_REPO_DIR (manager + downloaded torch venv)…"
+    rm -rf "$NODE_REPO_DIR"
+    ok "miniclosedai-node checkout removed"
+else
+    say "No miniclosedai-node checkout found — HuggingFace support wasn't enabled."
+fi
+
+if [ -d "$NODE_STATE_DIR" ]; then
+    rm -rf "$NODE_STATE_DIR"
+    ok "removed local node state ($NODE_STATE_DIR)"
 fi
 
 echo

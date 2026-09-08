@@ -1,0 +1,552 @@
+#!/usr/bin/env python3
+"""mcai-node — terminal client for this node's HuggingFace model manager.
+
+A trimmed, dependency-free port of miniclosedai-llm's `mc` CLI: analyze /
+run / stop / status / logs a HuggingFace model, manage the HF token, and
+register a launched model as a second backend on the interdata network
+(alongside this node's Ollama backend).
+
+Standard library only (argparse + urllib + json) — runs under any python3,
+no venv required (the manager itself needs one for torch; this CLI doesn't).
+Talks to the manager at $MANAGER_URL (default http://localhost:8099). Sends
+Authorization: Bearer $MANAGER_API_KEY when that env var is set.
+
+Common commands:
+    mcai-node info | ls
+    mcai-node analyze <hf_id>
+    mcai-node run <hf_id> [--wait] [--name N --port P --quant Q ...]
+    mcai-node status <id>            mcai-node logs <id> [-f]
+    mcai-node stop <id> | rm <id>
+    mcai-node hf-token [show|set|clear]
+    mcai-node register <id>          # add this model as a backend on the interdata network
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import socket
+import sys
+import time
+import urllib.error
+import urllib.request
+from pathlib import Path
+
+EXIT_OK, EXIT_ERR, EXIT_UNREACHABLE = 0, 1, 2
+
+NODE_STATE_DIR = Path(os.environ.get("MINICLOSEDAI_NODE_HOME", str(Path.home() / ".miniclosedai-node")))
+NODE_STATE_FILE = NODE_STATE_DIR / "node.json"
+
+
+# --------------------------------------------------------------------- config
+def _load_dotenv(path: Path) -> dict:
+    env = {}
+    if path.exists():
+        for line in path.read_text().splitlines():
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            k, v = line.split("=", 1)
+            env[k.strip()] = v.strip().strip('"').strip("'")
+    return env
+
+
+_DOTENV = _load_dotenv(NODE_STATE_DIR / ".env")
+
+
+def cfg(name: str, default: str = "") -> str:
+    return os.environ.get(name) or _DOTENV.get(name) or default
+
+
+def base_url() -> str:
+    url = cfg("MANAGER_URL")
+    if url:
+        return url.rstrip("/")
+    return f"http://localhost:{cfg('MANAGER_PORT', '8099')}"
+
+
+def _headers(extra: dict | None = None) -> dict:
+    h = {"Accept": "application/json"}
+    key = cfg("MANAGER_API_KEY")
+    if key:
+        h["Authorization"] = f"Bearer {key}"
+    if extra:
+        h.update(extra)
+    return h
+
+
+def _load_node_state() -> dict | None:
+    """This node's interdata-network identity, written by install.sh right
+    after POST /api/nodes/register succeeds: {node_id, node_api_key, hub_url}."""
+    if not NODE_STATE_FILE.exists():
+        return None
+    try:
+        return json.loads(NODE_STATE_FILE.read_text())
+    except (OSError, ValueError):
+        return None
+
+
+# --------------------------------------------------------------------- ANSI
+_TTY = sys.stdout.isatty()
+
+
+def c(text, color):
+    if not _TTY:
+        return text
+    codes = {"dim": "2", "red": "31", "green": "32", "yellow": "33",
+             "blue": "34", "cyan": "36", "bold": "1"}
+    return f"\033[{codes[color]}m{text}\033[0m"
+
+
+STATUS_COLOR = {"ready": "green", "error": "red", "stopped": "dim",
+                "pulling": "yellow", "starting": "yellow",
+                "downloading": "yellow", "loading": "yellow"}
+
+
+# --------------------------------------------------------------------- HTTP
+class ApiError(Exception):
+    def __init__(self, status, detail):
+        self.status = status
+        self.detail = detail
+        msg = detail.get("message") if isinstance(detail, dict) else detail
+        super().__init__(msg if isinstance(msg, str) else json.dumps(msg))
+
+
+class Unreachable(Exception):
+    pass
+
+
+def _request(method, path, *, data=None, headers=None, timeout=60):
+    url = path if path.startswith("http") else base_url() + path
+    req = urllib.request.Request(url, data=data, method=method, headers=_headers(headers))
+    try:
+        return urllib.request.urlopen(req, timeout=timeout)
+    except urllib.error.HTTPError as e:
+        body = e.read().decode(errors="replace")
+        try:
+            detail = json.loads(body).get("detail", body)
+        except ValueError:
+            detail = body
+        raise ApiError(e.code, detail)
+    except (urllib.error.URLError, ConnectionError, socket.timeout, OSError) as e:
+        raise Unreachable(str(e))
+
+
+def api_get(path, timeout=30):
+    with _request("GET", path, timeout=timeout) as r:
+        return json.loads(r.read().decode())
+
+
+def api_post(path, obj=None, timeout=120):
+    data = json.dumps(obj or {}).encode()
+    with _request("POST", path, data=data, headers={"Content-Type": "application/json"},
+                  timeout=timeout) as r:
+        body = r.read().decode()
+        return json.loads(body) if body else None
+
+
+def api_delete(path, timeout=60):
+    with _request("DELETE", path, timeout=timeout) as r:
+        body = r.read().decode()
+        return json.loads(body) if body else None
+
+
+# --------------------------------------------------------------------- helpers
+def die(msg, code=EXIT_ERR):
+    print(c("error:", "red") + " " + msg, file=sys.stderr)
+    sys.exit(code)
+
+
+def require_daemon():
+    """Friendly check that the manager is up; exits 2 if not."""
+    try:
+        return api_get("/api/health", timeout=8)
+    except Unreachable:
+        die(f"model manager not running at {base_url()} — check: "
+            f"sudo systemctl status miniclosedai-node-manager", EXIT_UNREACHABLE)
+    except ApiError as e:
+        if e.status in (401, 403):
+            die("unauthorized — set MANAGER_API_KEY to match the manager.", EXIT_UNREACHABLE)
+        raise
+
+
+def resolve_id(key: str) -> str:
+    models = api_get("/api/models")["models"]
+    ids = [m["id"] for m in models]
+    if key in ids:
+        return key
+    pref = [i for i in ids if i.startswith(key)]
+    if len(pref) == 1:
+        return pref[0]
+    byhf = [m["id"] for m in models if key.lower() in m["hf_id"].lower()]
+    if len(byhf) == 1:
+        return byhf[0]
+    if not models:
+        die("no models yet — run one first:  mcai-node run <hf_id>")
+    cands = pref or byhf or ids
+    die(f"'{key}' didn't match one model. Candidates: {', '.join(cands)}")
+
+
+def _table(rows, headers):
+    widths = [len(h) for h in headers]
+    for r in rows:
+        for i, cell in enumerate(r):
+            widths[i] = max(widths[i], len(str(cell)))
+    line = "  ".join(h.ljust(widths[i]) for i, h in enumerate(headers))
+    print(c(line, "bold"))
+    for r in rows:
+        print("  ".join(str(cell).ljust(widths[i]) for i, cell in enumerate(r)))
+
+
+# --------------------------------------------------------------------- commands
+def cmd_info(args):
+    h = require_daemon()
+    eng = h.get("engine")
+    print(f"{c('engine', 'dim')}   {eng}  ({'GPU ok' if h.get('gpu_ok') else c('no GPU', 'yellow')})")
+    print(f"{c('hf_home', 'dim')}  {h.get('hf_home')}")
+    sh = c("ready", "green") if h.get("shim_ok") else c("run manager/setup_shim.sh", "yellow")
+    print(f"{c('shim', 'dim')}     transformers (bare-metal, any model): {sh}")
+    dk = c("ready", "green") if h.get("docker_ok") else c(h.get("docker_msg", "unavailable"), "dim")
+    print(f"{c('docker', 'dim')}   {dk}")
+    if h.get("no_engine"):
+        print(c("  no launch engine — run manager/setup_shim.sh, or install Docker / `pip install vllm`", "red"))
+    try:
+        g = api_get("/api/gpu")
+        for gpu in g.get("gpus", []):
+            mem = "unified memory" if gpu["mem_total_mb"] is None else f"{gpu['mem_used_mb']}/{gpu['mem_total_mb']} MB"
+            print(f"{c('gpu', 'dim')}      GPU{gpu['index']} {gpu['name']} — {mem} ({gpu['util_pct']}%)")
+        if g.get("error"):
+            print(f"{c('gpu', 'dim')}      {c(g['error'], 'yellow')}")
+    except ApiError:
+        pass
+    state = _load_node_state()
+    if state:
+        print(f"{c('network', 'dim')}  node #{state.get('node_id')} on {state.get('hub_url')}")
+    else:
+        print(f"{c('network', 'dim')}  not registered with the interdata network yet")
+
+
+def cmd_ls(args):
+    require_daemon()
+    models = api_get("/api/models")["models"]
+    if args.json:
+        print(json.dumps(models, indent=2)); return
+    if not models:
+        print(c("no models — run one:  mcai-node run <hf_id>", "dim")); return
+    rows = []
+    for m in sorted(models, key=lambda x: x["id"]):
+        st = c(m["status"], STATUS_COLOR.get(m["status"], "dim"))
+        kind = "vision" if m.get("multimodal") else "text"
+        rows.append([m["id"], st, f":{m['port']}", kind, m["hf_id"]])
+    _table(rows, ["NAME", "STATUS", "PORT", "KIND", "HF_ID"])
+
+
+def cmd_analyze(args):
+    require_daemon()
+    a = api_post("/api/analyze", {"hf_id": args.hf_id})
+    if args.json:
+        print(json.dumps(a, indent=2)); return
+    if not a.get("exists"):
+        die(a.get("error", "not found"))
+    typ = "vision+text" if a["multimodal"] else "text"
+    print(f"{c(a['hf_id'], 'bold')}  ({typ})")
+    if a.get("fmt") == "gguf":
+        print(c("  format     GGUF — not supported on this node (no llama.cpp engine)", "yellow"))
+    if a.get("params"):
+        print(f"  params     {a['params']/1e9:.1f} B" + (f" · {a['dtype']}" if a.get('dtype') else ""))
+    if a.get("size_gb") is not None:
+        print(f"  weights    ~{a['size_gb']} GB")
+    if a.get("need_gb") is not None:
+        print(f"  needs      ~{a['need_gb']} GB")
+    print(f"  available  {a['available_gb']} GB / {a['total_gb']} GB total")
+    if a.get("gated"):
+        print("  gated      " + ("yes (HF_TOKEN set)" if a["hf_token_present"]
+                                  else c("yes — set one: mcai-node hf-token set", "yellow")))
+    verdict = c("fits ✓", "green") if a.get("fits") else c("may not fit ⚠", "yellow")
+    print(f"  verdict    {verdict}")
+
+
+def _prompt_and_set_token() -> bool:
+    import getpass
+    print(c("This is a gated Hugging Face model — it needs an access token.", "yellow"))
+    print("  1. Request access on the model's HF page (must be approved by the owner).")
+    print("  2. Create a READ token at https://huggingface.co/settings/tokens")
+    try:
+        token = getpass.getpass("  Paste HF token (hidden, blank to skip): ").strip()
+    except (EOFError, KeyboardInterrupt):
+        print()
+        return False
+    if not token:
+        return False
+    try:
+        r = api_post("/api/hf-token", {"token": token})
+    except ApiError as e:
+        print(c(f"  could not save token: {e}", "red"))
+        return False
+    if r.get("valid") and r.get("user"):
+        print(c(f"  saved — signed in as {r['user']}. Continuing…", "green"))
+    else:
+        print(c("  saved (couldn't verify with HF right now — it'll still be used).", "yellow"))
+    return True
+
+
+def cmd_hf_token(args):
+    require_daemon()
+    if args.action == "clear":
+        api_delete("/api/hf-token")
+        print("cleared HF token")
+        return
+    if args.action == "set":
+        token = args.token
+        if not token:
+            import getpass
+            token = getpass.getpass("Paste HF token (hidden): ").strip()
+        if not token:
+            die("no token provided")
+        r = api_post("/api/hf-token", {"token": token})
+        if r.get("valid") and r.get("user"):
+            print(c(f"saved — signed in as {r['user']} ({r['masked']})", "green"))
+        else:
+            print(c(f"saved ({r['masked']}) — couldn't verify with HF (network?)", "yellow"))
+        return
+    s = api_get("/api/hf-token")
+    if not s.get("present"):
+        print("HF token: " + c("not set", "yellow") + " — needed for gated models.")
+        print("  set it with:  " + c("mcai-node hf-token set", "cyan"))
+    elif s.get("user"):
+        print(f"HF token: {c('set', 'green')} — signed in as {s['user']} ({s['masked']})")
+    else:
+        print(f"HF token: {c('set', 'green')} ({s['masked']})"
+              + ("" if s.get("valid") else c(" — unverified", "yellow")))
+
+
+def _run_params(args) -> dict:
+    p = {}
+    if args.max_len is not None: p["max_model_len"] = args.max_len
+    if args.gpu_mem is not None: p["gpu_memory_util"] = args.gpu_mem
+    if args.tp is not None: p["tensor_parallel"] = args.tp
+    if args.max_images is not None: p["max_images"] = args.max_images
+    if args.quant: p["quantization"] = args.quant
+    if args.trust_remote_code: p["trust_remote_code"] = True
+    return p
+
+
+def cmd_run(args):
+    require_daemon()
+    if sys.stdin.isatty():
+        try:
+            a = api_post("/api/analyze", {"hf_id": args.hf_id})
+        except (ApiError, Unreachable):
+            a = None
+        if a and a.get("gated") and not a.get("hf_token_present"):
+            _prompt_and_set_token()
+    body = {"hf_id": args.hf_id, "run": True, "force": args.force}
+    if args.name: body["served_name"] = args.name
+    if args.port: body["port"] = args.port
+    p = _run_params(args)
+    if p: body["params"] = p
+    try:
+        m = api_post("/api/models", body)
+    except ApiError as e:
+        if e.status == 409:
+            msg = e.detail.get("message") if isinstance(e.detail, dict) else e.detail
+            die(f"{msg}\n  re-run with --force to launch anyway.")
+        die(str(e))
+    print(f"launching {c(m['served_name'], 'bold')} on :{m['port']}  "
+          f"({'vision' if m.get('multimodal') else 'text'}, {m.get('size_gb', '?')} GB)")
+    if not args.wait:
+        print(c(f"  watch:  mcai-node logs {m['id']} -f", "dim"))
+        return
+    _wait_ready(m["id"], args.timeout)
+
+
+def _wait_ready(mid, timeout):
+    start = time.time()
+    last = None
+    while time.time() - start < timeout:
+        st = api_get(f"/api/models/{mid}/status")
+        s = st["status"]
+        if s != last:
+            print(f"  [{int(time.time()-start):4d}s] {c(s, STATUS_COLOR.get(s, 'dim'))}")
+            last = s
+        if st.get("ready"):
+            print(c(f"ready — register it:  mcai-node register {mid}", "green"))
+            return
+        if s == "error":
+            die("failed to start:\n" + (st.get("detail") or "")[-800:])
+        time.sleep(3)
+    die(f"timed out after {timeout}s (last: {last})")
+
+
+def cmd_start(args):
+    require_daemon()
+    mid = resolve_id(args.id)
+    try:
+        m = api_post(f"/api/models/{mid}/start")
+    except ApiError as e:
+        die(str(e))
+    print(f"starting {c(mid, 'bold')} on :{m['port']}")
+    if args.wait:
+        _wait_ready(mid, args.timeout)
+    else:
+        print(c(f"  watch:  mcai-node logs {mid} -f", "dim"))
+
+
+def cmd_stop(args):
+    require_daemon()
+    mid = resolve_id(args.id)
+    api_post(f"/api/models/{mid}/stop")
+    print(f"stopped {mid}")
+
+
+def cmd_rm(args):
+    require_daemon()
+    mid = resolve_id(args.id)
+    api_delete(f"/api/models/{mid}")
+    print(f"removed {mid}  (weights kept in the HF cache)")
+
+
+def cmd_status(args):
+    require_daemon()
+    mid = resolve_id(args.id)
+    st = api_get(f"/api/models/{mid}/status")
+    if args.json:
+        print(json.dumps(st, indent=2)); return
+    print(f"{mid}: {c(st['status'], STATUS_COLOR.get(st['status'], 'dim'))}"
+          + (f"  ({st['detail']})" if st.get("detail") else ""))
+
+
+def cmd_logs(args):
+    require_daemon()
+    mid = resolve_id(args.id)
+    read_timeout = None if args.follow else 5.0
+    deadline = None if args.follow else time.time() + 6.0
+    try:
+        resp = _request("GET", f"/api/models/{mid}/logs", timeout=read_timeout)
+    except Unreachable as e:
+        die(str(e), EXIT_UNREACHABLE)
+    try:
+        for raw in resp:
+            if deadline and time.time() > deadline:
+                break
+            line = raw.decode(errors="replace").strip()
+            if not line.startswith("data:"):
+                continue
+            try:
+                d = json.loads(line[5:].strip())
+            except ValueError:
+                continue
+            if "line" in d:
+                print(d["line"])
+            elif d.get("eof"):
+                break
+    except (socket.timeout, TimeoutError):
+        pass
+    except KeyboardInterrupt:
+        pass
+    finally:
+        resp.close()
+
+
+def cmd_register(args):
+    require_daemon()
+    mid = resolve_id(args.id)
+    m = next(x for x in api_get("/api/models")["models"] if x["id"] == mid)
+    if not m.get("ready") and not args.force:
+        die(f"{mid} is '{m['status']}', not ready yet — wait for it "
+            f"(mcai-node status {mid}), or pass --force to register anyway.")
+    state = _load_node_state()
+    if not state:
+        die("this node hasn't registered with the interdata network yet — "
+            "re-run install.sh, or set MINICLOSEDAI_NODE_HOME to a directory "
+            "with a node.json ({node_id, node_api_key, hub_url}).")
+    name = args.name or f"{cfg('MINICLOSEDAI_NODE_NAME', socket.gethostname())} ({m['served_name']})"
+    body = {"name": name, "base_url": m["base_url"], "kind": "openai"}
+    url = state["hub_url"].rstrip("/") + f"/api/nodes/{state['node_id']}/backends"
+    req = urllib.request.Request(
+        url, data=json.dumps(body).encode(), method="POST",
+        headers={"Content-Type": "application/json",
+                 "Authorization": f"Bearer {state['node_api_key']}"})
+    try:
+        with urllib.request.urlopen(req, timeout=30) as r:
+            resp = json.loads(r.read().decode())
+    except urllib.error.HTTPError as e:
+        die(f"registration failed: HTTP {e.code} {e.read().decode(errors='replace')[:300]}")
+    except (urllib.error.URLError, OSError) as e:
+        die(f"could not reach {state['hub_url']}: {e}")
+    print(c(f"registered backend #{resp['backend_id']} ({resp['name']}) -> {resp['base_url']}", "green"))
+
+
+# --------------------------------------------------------------------- parser
+def build_parser():
+    p = argparse.ArgumentParser(
+        prog="mcai-node", description=__doc__,
+        formatter_class=argparse.RawDescriptionHelpFormatter)
+    sub = p.add_subparsers(dest="cmd")
+
+    sub.add_parser("info", help="engine + GPU + network status").set_defaults(fn=cmd_info)
+
+    for name in ("ls", "list"):
+        s = sub.add_parser(name, help="list models"); s.add_argument("--json", action="store_true"); s.set_defaults(fn=cmd_ls)
+
+    s = sub.add_parser("analyze", help="inspect a HF model before downloading")
+    s.add_argument("hf_id"); s.add_argument("--json", action="store_true"); s.set_defaults(fn=cmd_analyze)
+
+    s = sub.add_parser("hf-token", help="show / set / clear the Hugging Face access token (gated models)")
+    s.add_argument("action", nargs="?", choices=["show", "set", "clear"], default="show")
+    s.add_argument("--token", help="token value (omit to be prompted, hidden)")
+    s.set_defaults(fn=cmd_hf_token)
+
+    s = sub.add_parser("run", help="download + run a model")
+    s.add_argument("hf_id")
+    s.add_argument("--name", help="served model name (default: slug of repo)")
+    s.add_argument("--port", type=int)
+    s.add_argument("--quant", help="fp8 | awq | gptq")
+    s.add_argument("--max-len", type=int, dest="max_len")
+    s.add_argument("--gpu-mem", type=float, dest="gpu_mem")
+    s.add_argument("--tp", type=int, help="tensor parallel size (#GPUs)")
+    s.add_argument("--max-images", type=int, dest="max_images")
+    s.add_argument("--trust-remote-code", action="store_true")
+    s.add_argument("--force", action="store_true", help="launch even if it may not fit in free VRAM")
+    s.add_argument("--wait", action="store_true", help="poll until ready")
+    s.add_argument("--timeout", type=int, default=1200)
+    s.set_defaults(fn=cmd_run)
+
+    s = sub.add_parser("start", help="(re)start an existing stopped model by id")
+    s.add_argument("id"); s.add_argument("--wait", action="store_true")
+    s.add_argument("--timeout", type=int, default=1200); s.set_defaults(fn=cmd_start)
+
+    s = sub.add_parser("stop", help="stop a running model"); s.add_argument("id"); s.set_defaults(fn=cmd_stop)
+    s = sub.add_parser("rm", help="remove a model (keeps weights)"); s.add_argument("id"); s.set_defaults(fn=cmd_rm)
+    s = sub.add_parser("status", help="status of one model"); s.add_argument("id"); s.add_argument("--json", action="store_true"); s.set_defaults(fn=cmd_status)
+
+    s = sub.add_parser("logs", help="stream a model's logs"); s.add_argument("id")
+    s.add_argument("-f", "--follow", action="store_true", help="follow (Ctrl-C to stop)"); s.set_defaults(fn=cmd_logs)
+
+    s = sub.add_parser("register", help="add this model as a backend on the interdata network")
+    s.add_argument("id"); s.add_argument("--name", help="backend name (default: node + served name)")
+    s.add_argument("--force", action="store_true", help="register even if the model isn't ready yet")
+    s.set_defaults(fn=cmd_register)
+
+    return p
+
+
+def main(argv=None):
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    if not getattr(args, "fn", None):
+        parser.print_help(); return EXIT_OK
+    try:
+        args.fn(args)
+        return EXIT_OK
+    except Unreachable:
+        die(f"model manager not running at {base_url()} — check: "
+            f"sudo systemctl status miniclosedai-node-manager", EXIT_UNREACHABLE)
+    except ApiError as e:
+        die(str(e))
+    except BrokenPipeError:
+        return EXIT_OK
+
+
+if __name__ == "__main__":
+    sys.exit(main())
