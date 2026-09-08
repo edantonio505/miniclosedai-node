@@ -25,7 +25,22 @@ as much of a small card's VRAM as possible for the model itself.
    rather trade VRAM headroom for a larger model.)
 3. Installs the **`ask`** CLI ([edstui](https://github.com/edantonio505/edstui))
    via pipx — done before network registration below, so a node still ends
-   up with `ask` even if Tailscale/registration fails.
+   up with `ask` even if Tailscale/registration fails. Then optionally
+   configures `ask` to reach the interdata relay **directly**: miniaicloud
+   exposes a full native Ollama API at `$HUB_URL/api/*` (see
+   `app/routers/ollama_native.py` in miniaicloud), so `ask`'s own Ollama
+   client can talk to it with nothing in between — pointed there instead of
+   at this node's own small model, `ask` can reach whatever's actually
+   registered on the wider network (e.g. `qwen3.8:latest`), not just this
+   one node. This needs a **relay API key** — an admin-minted `ApiKey` from
+   miniaicloud's admin panel, a completely different credential from this
+   node's own `node_api_key` (that one only authorizes
+   `POST /api/nodes/{id}/backends`, nothing else). Prompted for
+   interactively (blank to skip, leaving `ask` installed but unconfigured),
+   or set `MINICLOSEDAI_NODE_ASK_API_KEY` to skip the prompt. **Note:** this
+   key is shared across every node's `ask`, and it's a real secret — never
+   commit it into this repo's source; keep it in your own private notes/env
+   and pass it at install time.
 4. *(Linux only)* Optionally installs a local **Latina voice pod**
    ([latinavoicepod](https://github.com/edantonio505/latinavoicepod)) —
    asked interactively, since it competes with the LLM for the same VRAM.
@@ -94,6 +109,8 @@ already set — useful for a non-interactive/scripted install.
 | `OLLAMA_CONTEXT_LENGTH` | `32768` | context window, in tokens |
 | `LATINA_DIR` | `$HOME/latinavoicepod` | where to clone latinavoicepod (Linux only) |
 | `ASK_REPO` | `git+https://github.com/edantonio505/edstui.git` | override for forks |
+| `MINICLOSEDAI_NODE_ASK_API_KEY` | *(prompts, blank = skip)* | relay API key so `ask` reaches interdata directly — never commit a real value |
+| `MINICLOSEDAI_NODE_ASK_MODEL` | `qwen3.8:latest` | model `ask` asks the relay for |
 | `MINICLOSEDAI_NODE_HF` | *(prompts, not offered on RunPod)* | `1`/`0` — enable HuggingFace model support |
 | `MINICLOSEDAI_NODE_HF_TOKEN` | *(prompts if HF support is enabled)* | HuggingFace access token to save (only needed for gated models) |
 | `MINICLOSEDAI_NODE_REPO_DIR` | `$HOME/miniclosedai-node` | where this repo gets cloned for the model manager + `mcai-node` CLI |

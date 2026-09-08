@@ -29,6 +29,12 @@
 #      miniclosedai's own installer. Deliberately done before network
 #      registration below, so a node still ends up with `ask` even if
 #      Tailscale/registration fails — useful for debugging exactly that.
+#      Then optionally configures `ask` to reach the interdata relay
+#      DIRECTLY (miniaicloud exposes a native Ollama API at $HUB_URL/api/*,
+#      not just this node's own small model) — needs a relay API key (an
+#      admin-minted ApiKey, NOT this node's own node_api_key — a separate
+#      credential), prompted for or via MINICLOSEDAI_NODE_ASK_API_KEY.
+#      Blank/skipped leaves `ask` installed but unconfigured.
 #   4. Asks whether to also run a local Latina voice pod (latinavoicepod) on
 #      this node — Linux only (its own start.sh assumes apt-get + a
 #      CUDA-matched torch build). Skip if this node is already tight on
@@ -70,6 +76,8 @@
 #   OLLAMA_CONTEXT_LENGTH     context window, in tokens (default: 32768)
 #   LATINA_DIR                where to clone latinavoicepod (default: $HOME/latinavoicepod)
 #   ASK_REPO                  edstui repo to pipx-install (default: git+https://github.com/edantonio505/edstui.git)
+#   MINICLOSEDAI_NODE_ASK_API_KEY  relay API key so `ask` reaches interdata directly (skips the prompt; blank = skip entirely)
+#   MINICLOSEDAI_NODE_ASK_MODEL    model `ask` asks the relay for (default: qwen3.8:latest)
 #   MINICLOSEDAI_NODE_HF      1/0 — enable HuggingFace model support (skips the prompt)
 #   MINICLOSEDAI_NODE_HF_TOKEN  HuggingFace access token to save (skips the prompt)
 #   MINICLOSEDAI_NODE_REPO_DIR  where to clone miniclosedai-node itself (default: $HOME/miniclosedai-node)
@@ -155,8 +163,15 @@ ensure_tool zstd zstd zstd "required by Ollama's own installer to extract its re
 # stdin, so a plain `read` here would immediately hit EOF instead of
 # prompting. Read from the controlling terminal directly instead — works
 # even with stdin occupied, as long as one is actually attached.
+# `[ -r /dev/tty ]` alone isn't enough: the device node can exist and pass a
+# stat-based permission check while actually opening it still fails with
+# ENXIO ("No such device or address") — real in a `docker exec` with no
+# allocated pty, which under `set -e` would otherwise kill the whole script
+# the first time a prompt is reached with nothing piped in for it. Test by
+# actually attempting to open it, inside an `if` condition (exempt from
+# `set -e`), rather than trusting the permission bits.
 prompt() {
-    if [ -r /dev/tty ]; then
+    if { : > /dev/tty; } 2>/dev/null; then
         printf '%s' "$1" > /dev/tty
         read -r REPLY < /dev/tty
     else
@@ -338,6 +353,39 @@ if command -v pipx >/dev/null 2>&1; then
         || warn "pipx install of $ASK_REPO failed (network?) — re-run later: pipx install --force $ASK_REPO"
 else
     warn "pipx still isn't installed after apt/pip attempts — \`ask\` was skipped. Install pipx manually, then: pipx install --force $ASK_REPO"
+fi
+
+# `ask` talks to whatever Ollama-shaped host EDS_TUI_URL points at using
+# Ollama's own native wire protocol (not this node's OpenAI-compatible
+# surfaces) — miniaicloud (the relay) exposes exactly that natively at
+# $HUB_URL/api/{tags,chat,...}, gated by a genuine relay API key (an ApiKey
+# tied to a user, NOT this node's own node_api_key — a completely separate
+# credential/table, so the node's registration secret can't be reused here).
+# Pointing `ask` there instead of at this node's own small model is what lets
+# it reach the wider interdata network, e.g. qwen3.8:latest if that's what's
+# registered there — not just whatever this one node happens to be running.
+if command -v ask >/dev/null 2>&1 || command -v pipx >/dev/null 2>&1; then
+    if [ -n "${MINICLOSEDAI_NODE_ASK_API_KEY:-}" ]; then
+        ASK_API_KEY="$MINICLOSEDAI_NODE_ASK_API_KEY"
+    else
+        prompt 'Interdata relay API key for `ask` (optional — lets `ask` reach the whole network, not just this node; mint one in miniaicloud admin -> API keys; blank to skip): '
+        ASK_API_KEY="$REPLY"
+    fi
+    if [ -n "$ASK_API_KEY" ]; then
+        BASH_ALIASES_FILE="$HOME/.bash_aliases"
+        touch "$BASH_ALIASES_FILE"
+        # Idempotent: drop any lines a PRIOR run of this installer added,
+        # so re-running doesn't pile up duplicate/stale exports.
+        sed -i '/^export EDS_TUI_URL=/d; /^export EDS_TUI_TOKEN=/d; /^export EDS_TUI_MODEL=/d' "$BASH_ALIASES_FILE"
+        {
+            printf 'export EDS_TUI_URL=%q\n' "$HUB_URL"
+            printf 'export EDS_TUI_TOKEN=%q\n' "$ASK_API_KEY"
+            printf 'export EDS_TUI_MODEL=%q\n' "${MINICLOSEDAI_NODE_ASK_MODEL:-qwen3.8:latest}"
+        } >> "$BASH_ALIASES_FILE"
+        ok "ask configured to reach interdata directly — open a new shell (or: source ~/.bash_aliases)"
+    else
+        say "No relay API key given — ask is installed but not yet pointed at interdata. Configure it later by adding EDS_TUI_URL/EDS_TUI_TOKEN to ~/.bash_aliases (see miniclosedai-node's README)."
+    fi
 fi
 
 # ---------- 4. Optional local voice pod (Linux only) ----------
