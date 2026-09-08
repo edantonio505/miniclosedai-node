@@ -244,9 +244,20 @@ fi
 # unit's configured Environment still looks correct — the exact trap that
 # made `systemctl show -p Environment` alone an unreliable signal.
 ollama_bound_to_all_interfaces() {
-    command -v ss >/dev/null 2>&1 || return 0  # can't check — assume fine
     local bound
-    bound="$(ss -ltn "sport = :${OLLAMA_PORT}" 2>/dev/null | tail -n +2)"
+    if command -v ss >/dev/null 2>&1; then
+        bound="$(ss -ltn "sport = :${OLLAMA_PORT}" 2>/dev/null | tail -n +2)"
+    elif command -v lsof >/dev/null 2>&1; then
+        # macOS has no `ss` (that's Linux/iproute2-only) — lsof is the
+        # native equivalent there. Without this fallback, the check above
+        # silently returned "fine" on every Mac, unverified — which is
+        # exactly how a real Mac install ended up claiming "bind already
+        # confirmed correct" while Ollama was, in fact, never actually
+        # reconfigured at all (see the Darwin branch below).
+        bound="$(lsof -nP -iTCP:"${OLLAMA_PORT}" -sTCP:LISTEN 2>/dev/null)"
+    else
+        return 0  # neither tool available — can't check, assume fine
+    fi
     case "$bound" in
         *"0.0.0.0:${OLLAMA_PORT}"*|*"*:${OLLAMA_PORT}"*|*":::${OLLAMA_PORT}"*) return 0 ;;
         *) return 1 ;;
@@ -293,12 +304,64 @@ ensure_ollama_listens_on_all_interfaces() {
             fail "Ollama still isn't listening on 0.0.0.0:${OLLAMA_PORT} after a clean restart (service is '${active:-unknown}'). Its configured Environment can look correct even when the process itself failed to (re)bind — check the real error with: sudo journalctl -u ollama -n 30 --no-pager"
         fi
         ok "Ollama confirmed listening on all interfaces (:${OLLAMA_PORT})"
+    elif [ "$OS" = "Darwin" ]; then
+        # The macOS Ollama app is a GUI process launched by launchd at
+        # login — launchd never reads ~/.zshrc or this script's own
+        # `export`, so setting the var here would have zero effect on an
+        # already-running app (this was a real, silent no-op on a real Mac
+        # install: the script just warned and moved on, Ollama kept
+        # serving 127.0.0.1-only the whole time). `launchctl setenv` is the
+        # actual mechanism macOS GUI apps read session-wide env from — but
+        # the ALREADY-RUNNING app still needs restarting to pick it up.
+        say "Configuring Ollama (macOS) to listen on all interfaces, keep the model loaded forever, and use a ${OLLAMA_CONTEXT_LENGTH}-token context…"
+        launchctl setenv OLLAMA_HOST "0.0.0.0:${OLLAMA_PORT}"
+        launchctl setenv OLLAMA_KEEP_ALIVE "-1"
+        launchctl setenv OLLAMA_CONTEXT_LENGTH "${OLLAMA_CONTEXT_LENGTH}"
+        if pgrep -x Ollama >/dev/null 2>&1; then
+            say "Restarting the Ollama app so it picks up the new settings…"
+            osascript -e 'quit app "Ollama"' >/dev/null 2>&1 || pkill -x Ollama 2>/dev/null || true
+            sleep 2
+            open -ga Ollama >/dev/null 2>&1 || true
+        elif pgrep -f "ollama serve" >/dev/null 2>&1; then
+            pkill -f "ollama serve" 2>/dev/null || true
+            sleep 1
+            OLLAMA_HOST="0.0.0.0:${OLLAMA_PORT}" OLLAMA_KEEP_ALIVE=-1 OLLAMA_CONTEXT_LENGTH="${OLLAMA_CONTEXT_LENGTH}" \
+                nohup ollama serve >/tmp/miniclosedai-node-ollama.log 2>&1 &
+            disown
+        fi
+        for _ in $(seq 1 20); do
+            sleep 0.5
+            curl -sf -m 2 "http://127.0.0.1:${OLLAMA_PORT}/api/tags" >/dev/null 2>&1 && break
+        done
+
+        # macOS's Application Firewall gates INCOMING connections per-app,
+        # independent of the bind address — the exact class of "bind is
+        # correct but a remote peer still gets refused" symptom that showed
+        # up on real hardware. It normally prompts interactively the first
+        # time an app accepts a connection, which never happens in a
+        # headless install; best-effort pre-approve it here, since the
+        # tailnet self-test further down would otherwise be the first (and
+        # unattended) time this is ever triggered.
+        if command -v /usr/libexec/ApplicationFirewall/socketfilterfw >/dev/null 2>&1; then
+            OLLAMA_BIN="$(command -v ollama)"
+            [ -n "$OLLAMA_BIN" ] && OLLAMA_BIN="$(cd "$(dirname "$OLLAMA_BIN")" && pwd)/$(basename "$OLLAMA_BIN")"
+            if [ -n "${OLLAMA_BIN:-}" ]; then
+                $SUDO /usr/libexec/ApplicationFirewall/socketfilterfw --add "$OLLAMA_BIN" >/dev/null 2>&1 || true
+                $SUDO /usr/libexec/ApplicationFirewall/socketfilterfw --unblockapp "$OLLAMA_BIN" >/dev/null 2>&1 || true
+            fi
+        fi
+
+        if ! ollama_bound_to_all_interfaces; then
+            fail "Ollama still isn't listening on 0.0.0.0:${OLLAMA_PORT} after restarting it — check Activity Monitor for a stuck Ollama process, quit it manually, then re-run."
+        fi
+        ok "Ollama confirmed listening on all interfaces (:${OLLAMA_PORT})"
     else
-        # No systemd-managed ollama.service (macOS, a non-systemd Linux, or
-        # Ollama running some other way entirely) — best effort: export for
-        # this script's own fallback `ollama serve` below. If Ollama is
-        # already running as its own app/service outside this script, it
-        # needs OLLAMA_HOST set and a manual restart for this to take effect.
+        # No systemd-managed ollama.service and not macOS (some other
+        # non-systemd Linux, or Ollama running some other way entirely) —
+        # best effort: export for this script's own fallback `ollama
+        # serve` below. If Ollama is already running as its own
+        # app/service outside this script, it needs OLLAMA_HOST set and a
+        # manual restart for this to take effect.
         export OLLAMA_HOST="0.0.0.0:${OLLAMA_PORT}"
         export OLLAMA_KEEP_ALIVE=-1
         export OLLAMA_CONTEXT_LENGTH
@@ -566,11 +629,16 @@ else
     ok "tailnet IP: $TS_IP"
 
     # A host firewall commonly permits loopback but blocks inbound connections
-    # on tailscale0 — invisible to both the earlier `ss` bind check and a plain
+    # on tailscale0 — invisible to both the earlier bind check and a plain
     # `curl 127.0.0.1` test, but exactly what would leave a node "ejected" even
-    # though Ollama is correctly bound to all interfaces. Open it proactively
-    # where ufw is in play; best-effort, not fatal if ufw isn't used at all.
-    if command -v ufw >/dev/null 2>&1 && $SUDO ufw status 2>/dev/null | grep -q "^Status: active"; then
+    # though Ollama is correctly bound to all interfaces. Open it proactively;
+    # best-effort, not fatal if the platform's firewall isn't in use at all.
+    if [ "$OS" = "Darwin" ]; then
+        # macOS's Application Firewall gates incoming connections per-app,
+        # not per-port — already best-effort pre-approved for the real
+        # ollama binary back in ensure_ollama_listens_on_all_interfaces().
+        :
+    elif command -v ufw >/dev/null 2>&1 && $SUDO ufw status 2>/dev/null | grep -q "^Status: active"; then
         say "Opening :${OLLAMA_PORT} for the tailscale0 interface (ufw is active)…"
         $SUDO ufw allow in on tailscale0 to any port "$OLLAMA_PORT" proto tcp comment 'miniclosedai-node: relay access' >/dev/null
         ok "ufw rule added for tailscale0:${OLLAMA_PORT}"
@@ -584,8 +652,14 @@ else
     # with the relay until this has actually been proven over the real path,
     # rather than finding out afterward from miniaicloud's side.
     say "Verifying the node is reachable at its tailnet address (the same path the relay will use)…"
-    curl -sf -m 5 "http://${TS_IP}:${OLLAMA_PORT}/api/tags" >/dev/null 2>&1 \
-        || fail "Ollama's bind was already confirmed correct (0.0.0.0:${OLLAMA_PORT}, via ss), but $TS_IP:${OLLAMA_PORT} still refuses a connection from this same machine — almost certainly a firewall (ufw/iptables) blocking the tailscale0 interface, not an Ollama config problem. Check 'sudo ufw status' / 'sudo iptables -L -n', allow inbound :${OLLAMA_PORT} on tailscale0, then re-run."
+    if ! curl -sf -m 5 "http://${TS_IP}:${OLLAMA_PORT}/api/tags" >/dev/null 2>&1; then
+        if [ "$OS" = "Darwin" ]; then
+            OLLAMA_BIN="$(command -v ollama || true)"
+            fail "Ollama's bind was already confirmed correct (0.0.0.0:${OLLAMA_PORT}), but ${TS_IP}:${OLLAMA_PORT} still refuses a connection from this same machine — almost certainly macOS's Application Firewall blocking the tailscale0 interface, not an Ollama config problem. Check: sudo /usr/libexec/ApplicationFirewall/socketfilterfw --getappblocked \"${OLLAMA_BIN:-\$(command -v ollama)}\" — or open System Settings → Network → Firewall → Options and allow incoming connections for Ollama, then re-run."
+        else
+            fail "Ollama's bind was already confirmed correct (0.0.0.0:${OLLAMA_PORT}), but ${TS_IP}:${OLLAMA_PORT} still refuses a connection from this same machine — almost certainly a firewall (ufw/iptables) blocking the tailscale0 interface, not an Ollama config problem. Check 'sudo ufw status' / 'sudo iptables -L -n', allow inbound :${OLLAMA_PORT} on tailscale0, then re-run."
+        fi
+    fi
     ok "confirmed reachable at ${TS_IP}:${OLLAMA_PORT} — the same address the relay will probe"
 
     say "Registering with $HUB_URL as an enabled backend…"
