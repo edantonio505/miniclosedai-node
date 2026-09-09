@@ -21,14 +21,23 @@
          total footprint at that context: ~4.4GB, comfortably under a 6GB
          budget with real headroom on an 8GB card. (The 9b variant's
          weights alone are 6.6GB, already over 6GB before any context or
-         overhead.)
+         overhead.) Also forces OLLAMA_HOST=0.0.0.0 by restarting Ollama
+         with that env var actually set on the new process (a registry-only
+         change doesn't reach an already-running Ollama), opens the port in
+         Windows Defender Firewall, and verifies the real bind via
+         Get-NetTCPConnection before proceeding.
       3. Installs Tailscale, exchanges the enrollment token for a join key
          via miniaicloud's POST /api/nodes/enroll, runs `tailscale up
-         --ssh --unattended` (keeps running after logout), then reports
-         this node's tailnet IP back via POST /api/nodes/register — the
-         node is enabled on the interdata network immediately, no extra
-         manual admin-approval step.
-      4. Installs the `ask` CLI (edstui) via pipx.
+         --ssh --unattended` (keeps running after logout), opens a
+         firewall rule scoped to the Tailscale adapter, then proves this
+         node is actually reachable at its own tailnet address (the same
+         path the relay's health probe uses) before ever registering —
+         refuses to register a backend known to be unreachable. Reports the
+         node's base_url via POST /api/nodes/register — enabled on the
+         interdata network immediately, no extra manual admin-approval step.
+      4. Installs the `ask` CLI (edstui) via pipx, then optionally points it
+         at the interdata relay directly (needs a relay API key — an
+         admin-minted ApiKey, not this node's own registration secret).
 
     NOT included on Windows: the local Latina voice pod option from
     install.sh. latinavoicepod's own setup assumes apt-get and a
@@ -45,6 +54,8 @@
       OLLAMA_PORT              port Ollama listens on (default: 11434)
       OLLAMA_CONTEXT_LENGTH    context window, in tokens (default: 32768)
       ASK_REPO                 edstui repo to pipx-install
+      MINICLOSEDAI_NODE_ASK_API_KEY  relay API key so ask reaches interdata directly (skips the prompt; blank = skip entirely)
+      MINICLOSEDAI_NODE_ASK_MODEL    model ask asks the relay for (default: qwen3.8:latest)
 #>
 
 $ErrorActionPreference = "Stop"
@@ -84,20 +95,20 @@ if (-not $Token) {
 if (-not $Token) { Fail "An enrollment token is required - mint one in miniaicloud's admin panel first." }
 
 # ---------- 2. Ollama + model ----------
-# Set OLLAMA_CONTEXT_LENGTH + OLLAMA_KEEP_ALIVE machine-wide (this script
-# already runs elevated) BEFORE Ollama's own first launch, so a fresh
-# install picks them up without a separate restart step. NOTE: if Ollama is
-# already installed and already running (the else branch below), this alone
-# will NOT change its behavior — a running process doesn't re-read the
-# environment. That mirrors a known, separate gap in this script: unlike
-# install.sh (which forces OLLAMA_HOST=0.0.0.0 via a systemd override +
-# verifies it with `ss`), this Windows path has no equivalent "restart
-# Ollama with new env vars" mechanism yet, for OLLAMA_HOST or these two. A
-# Windows node would hit the exact same 127.0.0.1-only-bind problem
-# install.sh had to fix on Linux. Untouched here deliberately — real,
-# separate work.
+# Ollama binds 127.0.0.1 only by default — the exact "port refused over the
+# tailnet even though everything else is fine" problem install.sh had to
+# fix for both Linux (systemd override) and macOS (launchctl setenv + app
+# restart). A registry env-var change alone does NOT affect a process
+# already running before this script ran, and Windows never broadcasts that
+# change to it — so the only mechanism that reliably works here too: set
+# the vars on THIS elevated process first (a child process always inherits
+# its parent's process-level environment immediately), then actually stop
+# and relaunch Ollama so the new process is the one that picks them up.
+$OllamaHostValue = "0.0.0.0:$OllamaPort"
+[Environment]::SetEnvironmentVariable("OLLAMA_HOST", $OllamaHostValue, "Machine")
 [Environment]::SetEnvironmentVariable("OLLAMA_CONTEXT_LENGTH", "$OllamaContextLength", "Machine")
 [Environment]::SetEnvironmentVariable("OLLAMA_KEEP_ALIVE", "-1", "Machine")
+$env:OLLAMA_HOST = $OllamaHostValue
 $env:OLLAMA_CONTEXT_LENGTH = "$OllamaContextLength"
 $env:OLLAMA_KEEP_ALIVE = "-1"
 
@@ -111,13 +122,36 @@ if (-not (Get-Command ollama -ErrorAction SilentlyContinue)) {
         Start-Process -FilePath $installer -ArgumentList "/SILENT" -Wait
     }
     Ok "Ollama installed"
+    Start-Sleep -Seconds 2   # the installer also launches Ollama once, using the pre-install env
 } else {
     Ok "Ollama already installed"
-    Warn "OLLAMA_CONTEXT_LENGTH/OLLAMA_KEEP_ALIVE were just set, but an already-running Ollama won't pick them up without a restart (quit it from the system tray and reopen, or 'taskkill /IM ollama.exe /F' then relaunch)."
 }
 
-# The Windows installer registers Ollama to start on login and serve
-# in the background; give it a moment, then confirm before pulling.
+Say "Restarting Ollama so it picks up OLLAMA_HOST=$OllamaHostValue..."
+Get-Process -Name "ollama", "ollama app" -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+Start-Sleep -Seconds 2
+# Prefer relaunching the tray app (same UX as a normal install — it starts
+# `ollama.exe serve` itself, inheriting the env we just set on this
+# process) and fall back to the bare server binary if only that exists.
+$ollamaAppExe = "$env:LOCALAPPDATA\Programs\Ollama\ollama app.exe"
+if (Test-Path $ollamaAppExe) {
+    Start-Process -FilePath $ollamaAppExe -WindowStyle Hidden
+} else {
+    $ollamaExe = (Get-Command ollama -ErrorAction SilentlyContinue).Source
+    if (-not $ollamaExe) { $ollamaExe = "$env:LOCALAPPDATA\Programs\Ollama\ollama.exe" }
+    if (-not (Test-Path $ollamaExe)) { Fail "Can't find ollama.exe to restart it - check the Ollama install." }
+    Start-Process -FilePath $ollamaExe -ArgumentList "serve" -WindowStyle Hidden
+}
+
+# Windows Defender Firewall blocks a freshly-listening port from remote
+# hosts by default — same class of gap as macOS's Application Firewall and
+# Linux's ufw, both of which install.sh already handles proactively. This
+# script already runs elevated, so it can just be created outright.
+if (-not (Get-NetFirewallRule -DisplayName "miniclosedai-node: Ollama" -ErrorAction SilentlyContinue)) {
+    New-NetFirewallRule -DisplayName "miniclosedai-node: Ollama" -Direction Inbound -Protocol TCP `
+        -LocalPort $OllamaPort -Action Allow -ErrorAction SilentlyContinue | Out-Null
+}
+
 $ollamaUp = $false
 for ($i = 0; $i -lt 20; $i++) {
     try {
@@ -126,7 +160,17 @@ for ($i = 0; $i -lt 20; $i++) {
         break
     } catch { Start-Sleep -Milliseconds 500 }
 }
-if (-not $ollamaUp) { Fail "Ollama isn't answering on :$OllamaPort - open the Ollama app once and re-run." }
+if (-not $ollamaUp) { Fail "Ollama isn't answering on :$OllamaPort after restarting it - check Task Manager for a stuck ollama.exe process." }
+
+# The check above only proves loopback reachability — 127.0.0.1-only
+# binding would pass it too. Get-NetTCPConnection is the Windows-native
+# equivalent of install.sh's `ss`/`lsof` bind check.
+$bound = Get-NetTCPConnection -LocalPort $OllamaPort -State Listen -ErrorAction SilentlyContinue |
+    Where-Object { $_.LocalAddress -eq "0.0.0.0" -or $_.LocalAddress -eq "::" }
+if (-not $bound) {
+    Fail "Ollama is listening on :$OllamaPort but only on a loopback/specific address, not 0.0.0.0 - the relay would not be able to reach this node. Check 'Get-NetTCPConnection -LocalPort $OllamaPort' and the OLLAMA_HOST env var."
+}
+Ok "Ollama confirmed listening on all interfaces (:$OllamaPort)"
 
 Say "Pulling $OllamaModel (comfortably under a 6GB VRAM budget with room to spare)..."
 & ollama pull $OllamaModel
@@ -180,11 +224,43 @@ for ($i = 0; $i -lt 10; $i++) {
 if (-not $TsIp) { Fail "Joined the tailnet but couldn't read this node's IP (tailscale ip -4)." }
 Ok "tailnet IP: $TsIp"
 
+# Scope a second firewall rule specifically to the Tailscale adapter, same
+# as install.sh's `ufw allow in on tailscale0` — belt-and-suspenders with
+# the all-interfaces rule added in step 2, and the one that actually
+# matters for reachability over the tailnet specifically.
+try {
+    if (-not (Get-NetFirewallRule -DisplayName "miniclosedai-node: Ollama (Tailscale)" -ErrorAction SilentlyContinue)) {
+        New-NetFirewallRule -DisplayName "miniclosedai-node: Ollama (Tailscale)" -Direction Inbound -Protocol TCP `
+            -LocalPort $OllamaPort -InterfaceAlias "Tailscale" -Action Allow -ErrorAction Stop | Out-Null
+    }
+} catch {
+    Warn "couldn't scope a firewall rule to the Tailscale adapter ($($_.Exception.Message)) - the all-interfaces rule from step 2 should still cover this."
+}
+
+# The definitive test: curl this node's OWN tailnet address, not loopback —
+# the exact address:port the relay's health probe will use. Tailscale SSH
+# working is NOT evidence this works: it's authorized through its own
+# separate ACL policy, independent of general port reachability. Refuse to
+# register a backend with the relay until this has actually been proven
+# over the real path, rather than finding out afterward from miniaicloud's
+# side — the same guarantee install.sh already makes on Linux/macOS.
+Say "Verifying the node is reachable at its tailnet address (the same path the relay will use)..."
+$reachable = $false
+try {
+    Invoke-RestMethod -Uri "http://$($TsIp):$($OllamaPort)/api/tags" -TimeoutSec 5 | Out-Null
+    $reachable = $true
+} catch {}
+if (-not $reachable) {
+    Fail "Ollama's bind was already confirmed correct (0.0.0.0:$OllamaPort), but $($TsIp):$($OllamaPort) still refuses a connection from this same machine - almost certainly Windows Defender Firewall blocking the Tailscale interface, not an Ollama config problem. Check: Get-NetFirewallRule -DisplayName 'miniclosedai-node: Ollama (Tailscale)' | Get-NetFirewallPortFilter — or open Windows Defender Firewall -> Advanced Settings -> Inbound Rules and allow TCP $OllamaPort on the Tailscale adapter, then re-run."
+}
+Ok "confirmed reachable at $($TsIp):$($OllamaPort) - the same address the relay will probe"
+
+$NodeBaseUrl = "http://$($TsIp):$($OllamaPort)"
 Say "Registering with $HubUrl as an enabled backend..."
 try {
     $register = Invoke-RestMethod -Method Post -Uri "$HubUrl/api/nodes/register" `
         -ContentType "application/json" `
-        -Body (@{ token = $Token; name = $NodeName; tailscale_ip = $TsIp; ollama_port = [int]$OllamaPort } | ConvertTo-Json)
+        -Body (@{ token = $Token; name = $NodeName; base_url = $NodeBaseUrl } | ConvertTo-Json)
 } catch {
     Fail "Registration failed. $($_.Exception.Message)"
 }
@@ -223,6 +299,31 @@ if (-not $pyCmd) {
         Say "Installing the ask CLI (edstui)..."
         pipx install --force $AskRepo
         Ok "ask CLI ready - open a new terminal and run: ask"
+
+        # `ask` talks to whatever Ollama-shaped host EDS_TUI_URL points at
+        # using Ollama's own native wire protocol — miniaicloud (the relay)
+        # exposes exactly that natively at $HubUrl/api/{tags,chat,...},
+        # gated by a genuine relay API key (an ApiKey tied to a user, NOT
+        # this node's own node_api_key — a completely separate credential).
+        # Pointing `ask` there instead of at this node's own small model is
+        # what lets it reach the wider interdata network. Set at User scope
+        # via the registry, not a profile file — unlike install.sh's
+        # ~/.bash_aliases/~/.zshrc (which depend on which shell profile a
+        # new terminal happens to source), a User-scope Windows env var is
+        # inherited by every new process automatically, no such dependency.
+        $AskApiKey = $env:MINICLOSEDAI_NODE_ASK_API_KEY
+        if (-not $AskApiKey) {
+            $AskApiKey = Read-Host "Interdata relay API key for ask (optional - lets ask reach the whole network, not just this node; mint one in miniaicloud admin -> API keys; blank to skip)"
+        }
+        if ($AskApiKey) {
+            $AskModel = if ($env:MINICLOSEDAI_NODE_ASK_MODEL) { $env:MINICLOSEDAI_NODE_ASK_MODEL } else { "qwen3.8:latest" }
+            [Environment]::SetEnvironmentVariable("EDS_TUI_URL", $HubUrl, "User")
+            [Environment]::SetEnvironmentVariable("EDS_TUI_TOKEN", $AskApiKey, "User")
+            [Environment]::SetEnvironmentVariable("EDS_TUI_MODEL", $AskModel, "User")
+            Ok "ask configured to reach interdata directly - open a new terminal to pick it up"
+        } else {
+            Say "No relay API key given - ask is installed but not yet pointed at interdata. Set EDS_TUI_URL/EDS_TUI_TOKEN later (see miniclosedai-node's README)."
+        }
     } else {
         Warn "pipx still not on PATH this session - open a new terminal and run: pipx install $AskRepo"
     }
