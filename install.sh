@@ -32,10 +32,11 @@
 #      Ollama's default 5-minute idle timeout — the relay may route to this
 #      node unpredictably, and a cold-load on the first request after any
 #      quiet period would be bad latency.
-#   3. Installs the `ask` CLI (edstui) via pipx — same pattern as
-#      miniclosedai's own installer. Deliberately done before network
-#      registration below, so a node still ends up with `ask` even if
-#      Tailscale/registration fails — useful for debugging exactly that.
+#   3. Installs the `ask` CLI (published to npm as `eds-tui`) via npm —
+#      installing Node.js first if this box doesn't already have a new
+#      enough version. Deliberately done before network registration below,
+#      so a node still ends up with `ask` even if Tailscale/registration
+#      fails — useful for debugging exactly that.
 #      Then optionally configures `ask` to reach the interdata relay
 #      DIRECTLY (miniaicloud exposes a native Ollama API at $HUB_URL/api/*,
 #      not just this node's own small model) — needs a relay API key (an
@@ -82,7 +83,6 @@
 #   OLLAMA_PORT               port Ollama listens on (default: 11434)
 #   OLLAMA_CONTEXT_LENGTH     context window, in tokens (default: 32768)
 #   LATINA_DIR                where to clone latinavoicepod (default: $HOME/latinavoicepod)
-#   ASK_REPO                  edstui repo to pipx-install (default: git+https://github.com/edantonio505/edstui.git)
 #   MINICLOSEDAI_NODE_ASK_API_KEY  relay API key so `ask` reaches interdata directly (skips the prompt; blank = skip entirely)
 #   MINICLOSEDAI_NODE_ASK_MODEL    model `ask` asks the relay for (default: qwen3.8:latest)
 #   MINICLOSEDAI_NODE_HF      1/0 — enable HuggingFace model support (skips the prompt)
@@ -128,7 +128,6 @@ OLLAMA_PORT="${OLLAMA_PORT:-11434}"
 # K/V on only 1-in-4 layers) — comfortably inside a 6GB budget with qwen3.5:4b.
 OLLAMA_CONTEXT_LENGTH="${OLLAMA_CONTEXT_LENGTH:-32768}"
 LATINA_DIR="${LATINA_DIR:-$HOME/latinavoicepod}"
-ASK_REPO="${ASK_REPO:-git+https://github.com/edantonio505/edstui.git}"
 
 if [ -t 1 ]; then
     BOLD=$'\e[1m'; GREEN=$'\e[32m'; RED=$'\e[31m'; DIM=$'\e[2m'; RST=$'\e[0m'
@@ -173,12 +172,11 @@ ensure_tool() {
         && ok "$apt_pkg installed" \
         || warn "couldn't install $apt_pkg automatically — install it manually, then re-run"
 }
-# `git` isn't a dependency of the `pipx` apt package, and `pipx install
-# git+https://...` needs it on PATH just to clone the repo — without it,
-# the `ask` (edstui) install step below fails silently on any box that
-# doesn't already happen to have git (this dev machine always has, which is
-# why this went uncaught here).
-ensure_tool git git git "required by pipx to install the \`ask\` CLI from GitHub"
+# Needed for the optional latinavoicepod / miniclosedai-node (HuggingFace
+# support) clones further down — not guaranteed present on a fresh box
+# (this dev machine always has it, which is why a prior version of this
+# script went uncaught missing it entirely).
+ensure_tool git git git "required to clone latinavoicepod / miniclosedai-node when those optional steps are used"
 # Ollama's own official installer extracts a .tar.zst archive and hard-fails
 # with "This version requires zstd for extraction" if it's missing — not
 # guaranteed present either (surfaced on arm64 while building this script's
@@ -439,36 +437,54 @@ else
     warn "model doesn't show as loaded in 'ollama ps' — check 'sudo journalctl -u ollama -n 30 --no-pager' if the node responds slowly to its first request"
 fi
 
-# ---------- 3. ask (edstui) ----------
+# ---------- 3. ask (eds-tui, via npm) ----------
 # Installed here, before network registration, so a node still ends up with
 # `ask` even if Tailscale/registration fails further down — this used to
 # run last, so a registration hiccup meant the script never reached it at
 # all, compounding the very problem `ask` would help debug.
-# `pip install --user pipx` alone fails outright on modern Debian/Ubuntu
-# (PEP 668 "externally managed environment") unless --break-system-packages
-# is passed or apt is used instead — and a bare `|| warn` here would swallow
-# that failure silently, so pipx (and therefore `ask`) would never actually
-# get installed. Try apt first (Debian/Ubuntu's own recommended path,
-# sidesteps PEP 668 entirely), then pip with the override flag, then plain
-# pip for older systems that predate PEP 668 altogether.
-if ! command -v pipx >/dev/null 2>&1; then
-    say "Installing pipx (for the \`ask\` CLI)…"
-    if command -v apt-get >/dev/null 2>&1; then
-        $SUDO apt-get update -qq && $SUDO apt-get install -y -qq pipx
-    fi
-    if ! command -v pipx >/dev/null 2>&1; then
-        python3 -m pip install -q --user pipx --break-system-packages 2>/dev/null \
-            || python3 -m pip install -q --user pipx
-    fi
-    python3 -m pipx ensurepath >/dev/null 2>&1 || true
-    export PATH="$HOME/.local/bin:$PATH"
+#
+# eds-tui (the `ask` CLI) is a TypeScript/Node package published to npm —
+# no git clone or Python/pipx toolchain needed on the target machine at
+# install time, which is the entire reason it was rewritten from the
+# original Python/pipx-installed edstui: a `pipx install git+https://...`
+# had to successfully clone the repo on every single target box, and that
+# step alone was the single most common real-world failure across this
+# script's whole install history (TLS/clock issues, a missing git binary,
+# PEP 668 breaking pipx itself, a flat `git clone` failure on at least one
+# real Raspberry Pi). `npm install -g eds-tui` just downloads a prebuilt
+# package from the registry over HTTPS instead.
+#
+# eds-tui needs Node.js >=20; a fresh/older box may not have that (or any
+# Node at all), so install/upgrade it first via NodeSource's official setup
+# script on Debian/Ubuntu (apt's own default `nodejs` package is often years
+# out of date on LTS releases — e.g. Ubuntu 22.04 ships Node 12), or brew on
+# macOS.
+NODE_MAJOR_OK=0
+if command -v node >/dev/null 2>&1; then
+    NODE_MAJOR="$(node -e 'console.log(process.versions.node.split(".")[0])' 2>/dev/null || echo 0)"
+    [ "${NODE_MAJOR:-0}" -ge 20 ] 2>/dev/null && NODE_MAJOR_OK=1
 fi
-if command -v pipx >/dev/null 2>&1; then
-    say "Installing the \`ask\` CLI (edstui)…"
-    pipx install --quiet --force "$ASK_REPO" && ok "ask CLI ready — run \`ask\` from any shell" \
-        || warn "pipx install of $ASK_REPO failed (network?) — re-run later: pipx install --force $ASK_REPO"
+if [ "$NODE_MAJOR_OK" != "1" ]; then
+    say "Installing Node.js (for the \`ask\` CLI — eds-tui needs >=20; what's on this box is missing or too old)…"
+    if [ "$OS" = "Darwin" ] && command -v brew >/dev/null 2>&1; then
+        brew install node
+    elif command -v apt-get >/dev/null 2>&1; then
+        curl -fsSL https://deb.nodesource.com/setup_22.x | $SUDO bash - >/dev/null 2>&1 \
+            && $SUDO apt-get install -y -qq nodejs
+    fi
+    if command -v node >/dev/null 2>&1; then
+        ok "Node.js $(node -v) installed"
+    else
+        warn "couldn't install Node.js automatically — install it manually (https://nodejs.org), then: npm install -g eds-tui"
+    fi
+fi
+
+if command -v npm >/dev/null 2>&1; then
+    say "Installing the \`ask\` CLI (eds-tui)…"
+    npm install -g eds-tui --silent 2>/dev/null && ok "ask CLI ready — run \`ask\` from any shell" \
+        || warn "npm install of eds-tui failed (network?) — re-run later: npm install -g eds-tui"
 else
-    warn "pipx still isn't installed after apt/pip attempts — \`ask\` was skipped. Install pipx manually, then: pipx install --force $ASK_REPO"
+    warn "npm still isn't available after the Node.js bootstrap — \`ask\` was skipped. Install Node.js manually, then: npm install -g eds-tui"
 fi
 
 # `ask` talks to whatever Ollama-shaped host EDS_TUI_URL points at using
@@ -480,7 +496,7 @@ fi
 # Pointing `ask` there instead of at this node's own small model is what lets
 # it reach the wider interdata network, e.g. qwen3.8:latest if that's what's
 # registered there — not just whatever this one node happens to be running.
-if command -v ask >/dev/null 2>&1 || command -v pipx >/dev/null 2>&1; then
+if command -v ask >/dev/null 2>&1 || command -v npm >/dev/null 2>&1; then
     if [ -n "${MINICLOSEDAI_NODE_ASK_API_KEY:-}" ]; then
         ASK_API_KEY="$MINICLOSEDAI_NODE_ASK_API_KEY"
     else

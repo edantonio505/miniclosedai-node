@@ -35,8 +35,9 @@
          refuses to register a backend known to be unreachable. Reports the
          node's base_url via POST /api/nodes/register — enabled on the
          interdata network immediately, no extra manual admin-approval step.
-      4. Installs the `ask` CLI (edstui) via pipx, then optionally points it
-         at the interdata relay directly (needs a relay API key — an
+      4. Installs the `ask` CLI (published to npm as `eds-tui`) via npm —
+         installing Node.js first if needed — then optionally points it at
+         the interdata relay directly (needs a relay API key — an
          admin-minted ApiKey, not this node's own registration secret).
 
     NOT included on Windows: the local Latina voice pod option from
@@ -53,7 +54,6 @@
       OLLAMA_MODEL             model to pull (default: qwen3.5:4b)
       OLLAMA_PORT              port Ollama listens on (default: 11434)
       OLLAMA_CONTEXT_LENGTH    context window, in tokens (default: 32768)
-      ASK_REPO                 edstui repo to pipx-install
       MINICLOSEDAI_NODE_ASK_API_KEY  relay API key so ask reaches interdata directly (skips the prompt; blank = skip entirely)
       MINICLOSEDAI_NODE_ASK_MODEL    model ask asks the relay for (default: qwen3.8:latest)
 #>
@@ -65,7 +65,6 @@ $NodeName   = if ($env:MINICLOSEDAI_NODE_NAME) { $env:MINICLOSEDAI_NODE_NAME } e
 $OllamaModel = if ($env:OLLAMA_MODEL) { $env:OLLAMA_MODEL } else { "qwen3.5:4b" }
 $OllamaPort  = if ($env:OLLAMA_PORT)  { $env:OLLAMA_PORT }  else { 11434 }
 $OllamaContextLength = if ($env:OLLAMA_CONTEXT_LENGTH) { $env:OLLAMA_CONTEXT_LENGTH } else { 32768 }
-$AskRepo     = if ($env:ASK_REPO)     { $env:ASK_REPO }     else { "git+https://github.com/edantonio505/edstui.git" }
 
 function Say($msg)  { Write-Host $msg }
 function Ok($msg)   { Write-Host "OK  $msg" -ForegroundColor Green }
@@ -266,67 +265,68 @@ try {
 }
 Ok "registered: backend #$($register.backend_id) -> $($register.base_url)"
 
-# ---------- 4. ask (edstui) ----------
-# `pipx install git+https://...` needs git on PATH just to clone the repo —
-# without it this step fails silently on any box that doesn't already
-# happen to have git installed. Not fatal: a missing `ask` CLI shouldn't
-# block the node's actual registration, which never touches git.
-if (-not (Get-Command git -ErrorAction SilentlyContinue)) {
-    Say "Installing git (required by pipx to install the ask CLI from GitHub)..."
+# ---------- 4. ask (eds-tui, via npm) ----------
+# eds-tui (the `ask` CLI) is a TypeScript/Node package published to npm —
+# no git clone or Python/pipx toolchain needed on the target machine at
+# install time, which is the entire reason it was rewritten from the
+# original Python/pipx-installed edstui: a `pipx install git+https://...`
+# had to successfully clone the repo on every single target box, and that
+# was the single most common real-world install failure across this
+# script's history. `npm install -g eds-tui` just downloads a prebuilt
+# package from the registry over HTTPS instead. Needs Node.js >=20;
+# install it via winget if this box doesn't already have a new enough
+# version.
+$nodeMajorOk = $false
+if (Get-Command node -ErrorAction SilentlyContinue) {
+    try {
+        $nodeMajor = [int](node -e "console.log(process.versions.node.split('.')[0])")
+        if ($nodeMajor -ge 20) { $nodeMajorOk = $true }
+    } catch {}
+}
+if (-not $nodeMajorOk) {
+    Say "Installing Node.js (for the ask CLI - eds-tui needs >=20; what's on this box is missing or too old)..."
     if (Get-Command winget -ErrorAction SilentlyContinue) {
-        winget install --silent --accept-package-agreements --accept-source-agreements Git.Git
-        $env:Path = "$env:ProgramFiles\Git\cmd;$env:Path"
+        winget install --silent --accept-package-agreements --accept-source-agreements OpenJS.NodeJS.LTS
+        $env:Path = "$env:ProgramFiles\nodejs;$env:Path"
     }
-    if (-not (Get-Command git -ErrorAction SilentlyContinue)) {
-        Warn "couldn't install git automatically - the ask CLI install step below will fail until it's installed manually (winget install Git.Git)"
+    if (Get-Command node -ErrorAction SilentlyContinue) {
+        Ok "Node.js $(node -v) installed"
     } else {
-        Ok "git installed"
+        Warn "couldn't install Node.js automatically - install it manually (https://nodejs.org), then: npm install -g eds-tui"
     }
 }
 
-$pyCmd = Get-Command python -ErrorAction SilentlyContinue
-if (-not $pyCmd) { $pyCmd = Get-Command py -ErrorAction SilentlyContinue }
-if (-not $pyCmd) {
-    Warn "Python not found - install it (winget install Python.Python.3.12), then: pip install --user pipx; pipx install $AskRepo"
-} else {
-    if (-not (Get-Command pipx -ErrorAction SilentlyContinue)) {
-        Say "Installing pipx (for the ask CLI)..."
-        & $pyCmd.Source -m pip install -q --user pipx
-        & $pyCmd.Source -m pipx ensurepath | Out-Null
-        $env:Path = "$env:USERPROFILE\.local\bin;$env:Path"
-    }
-    if (Get-Command pipx -ErrorAction SilentlyContinue) {
-        Say "Installing the ask CLI (edstui)..."
-        pipx install --force $AskRepo
-        Ok "ask CLI ready - open a new terminal and run: ask"
+if (Get-Command npm -ErrorAction SilentlyContinue) {
+    Say "Installing the ask CLI (eds-tui)..."
+    npm install -g eds-tui --silent
+    Ok "ask CLI ready - open a new terminal and run: ask"
 
-        # `ask` talks to whatever Ollama-shaped host EDS_TUI_URL points at
-        # using Ollama's own native wire protocol — miniaicloud (the relay)
-        # exposes exactly that natively at $HubUrl/api/{tags,chat,...},
-        # gated by a genuine relay API key (an ApiKey tied to a user, NOT
-        # this node's own node_api_key — a completely separate credential).
-        # Pointing `ask` there instead of at this node's own small model is
-        # what lets it reach the wider interdata network. Set at User scope
-        # via the registry, not a profile file — unlike install.sh's
-        # ~/.bash_aliases/~/.zshrc (which depend on which shell profile a
-        # new terminal happens to source), a User-scope Windows env var is
-        # inherited by every new process automatically, no such dependency.
-        $AskApiKey = $env:MINICLOSEDAI_NODE_ASK_API_KEY
-        if (-not $AskApiKey) {
-            $AskApiKey = Read-Host "Interdata relay API key for ask (optional - lets ask reach the whole network, not just this node; mint one in miniaicloud admin -> API keys; blank to skip)"
-        }
-        if ($AskApiKey) {
-            $AskModel = if ($env:MINICLOSEDAI_NODE_ASK_MODEL) { $env:MINICLOSEDAI_NODE_ASK_MODEL } else { "qwen3.8:latest" }
-            [Environment]::SetEnvironmentVariable("EDS_TUI_URL", $HubUrl, "User")
-            [Environment]::SetEnvironmentVariable("EDS_TUI_TOKEN", $AskApiKey, "User")
-            [Environment]::SetEnvironmentVariable("EDS_TUI_MODEL", $AskModel, "User")
-            Ok "ask configured to reach interdata directly - open a new terminal to pick it up"
-        } else {
-            Say "No relay API key given - ask is installed but not yet pointed at interdata. Set EDS_TUI_URL/EDS_TUI_TOKEN later (see miniclosedai-node's README)."
-        }
-    } else {
-        Warn "pipx still not on PATH this session - open a new terminal and run: pipx install $AskRepo"
+    # `ask` talks to whatever Ollama-shaped host EDS_TUI_URL points at
+    # using Ollama's own native wire protocol — miniaicloud (the relay)
+    # exposes exactly that natively at $HubUrl/api/{tags,chat,...},
+    # gated by a genuine relay API key (an ApiKey tied to a user, NOT
+    # this node's own node_api_key — a completely separate credential).
+    # Pointing `ask` there instead of at this node's own small model is
+    # what lets it reach the wider interdata network. Set at User scope
+    # via the registry, not a profile file — unlike install.sh's
+    # ~/.bash_aliases/~/.zshrc (which depend on which shell profile a
+    # new terminal happens to source), a User-scope Windows env var is
+    # inherited by every new process automatically, no such dependency.
+    $AskApiKey = $env:MINICLOSEDAI_NODE_ASK_API_KEY
+    if (-not $AskApiKey) {
+        $AskApiKey = Read-Host "Interdata relay API key for ask (optional - lets ask reach the whole network, not just this node; mint one in miniaicloud admin -> API keys; blank to skip)"
     }
+    if ($AskApiKey) {
+        $AskModel = if ($env:MINICLOSEDAI_NODE_ASK_MODEL) { $env:MINICLOSEDAI_NODE_ASK_MODEL } else { "qwen3.8:latest" }
+        [Environment]::SetEnvironmentVariable("EDS_TUI_URL", $HubUrl, "User")
+        [Environment]::SetEnvironmentVariable("EDS_TUI_TOKEN", $AskApiKey, "User")
+        [Environment]::SetEnvironmentVariable("EDS_TUI_MODEL", $AskModel, "User")
+        Ok "ask configured to reach interdata directly - open a new terminal to pick it up"
+    } else {
+        Say "No relay API key given - ask is installed but not yet pointed at interdata. Set EDS_TUI_URL/EDS_TUI_TOKEN later (see miniclosedai-node's README)."
+    }
+} else {
+    Warn "npm still isn't available after the Node.js bootstrap - ask CLI was skipped. Install Node.js manually, then: npm install -g eds-tui"
 }
 
 Write-Host ""

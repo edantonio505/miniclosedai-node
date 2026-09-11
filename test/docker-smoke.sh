@@ -9,14 +9,16 @@
 # preinstalled — every real Ubuntu install already has these, and the
 # documented `curl -fsSL ... | bash` one-liner itself requires curl to
 # already exist just to fetch this script — but deliberately WITHOUT git or
-# pipx preinstalled, since those are exactly what install.sh must install
-# for itself, and exactly what silently failed to happen on real hardware.
+# Node.js/npm preinstalled, since those are exactly what install.sh must
+# install for itself (git for the optional latinavoicepod/HF clones; Node.js
+# because `ask`, published to npm as eds-tui, needs >=20 and a fresh Ubuntu
+# box has none at all).
 #
-# What this DOES validate, for real: git auto-install, pipx auto-install
-# (apt path), `pipx install` of edstui actually succeeding, Ollama
-# installing + pulling a real (small) model in CPU mode, the model loading
-# and staying resident, and the bind-to-all-interfaces check running for
-# real (iproute2/`ss` is present). The container also has no systemd
+# What this DOES validate, for real: git auto-install, Node.js auto-install
+# (NodeSource + apt path), `npm install -g eds-tui` actually succeeding,
+# Ollama installing + pulling a real (small) model in CPU mode, the model
+# loading and staying resident, and the bind-to-all-interfaces check running
+# for real (iproute2/`ss` is present). The container also has no systemd
 # (PID 1 is just bash) — same as most containers and non-systemd hosts — so
 # this exercises install.sh's non-systemd fallback path along the way.
 #
@@ -65,7 +67,7 @@ fi
 
 BOOTSTRAP='apt-get update -qq && apt-get install -y -qq curl python3 ca-certificates iproute2 && bash /install.sh'
 
-echo "Running install.sh inside a clean ${IMAGE} container (curl/python3/ss preinstalled, git/pipx deliberately not)…"
+echo "Running install.sh inside a clean ${IMAGE} container (curl/python3/ss preinstalled, git/Node.js deliberately not)…"
 echo "(full transcript: $LOG)"
 echo
 
@@ -88,8 +90,8 @@ check() {
 }
 
 check "git auto-installed"          "git installed"
-check "pipx step reached"           "Installing the \`ask\` CLI"
-check "ask CLI installed via pipx"  "ask CLI ready"
+check "Node.js bootstrap reached"   "Installing Node.js"
+check "ask CLI installed via npm"   "ask CLI ready"
 # "model ready" can only be reached if the bind-to-all-interfaces check
 # (real, since iproute2/`ss` is installed) already passed — a failed check
 # calls fail() and halts the script before ever pulling the model, on both
@@ -112,7 +114,7 @@ fi
 
 echo "----------------------------------------"
 if [ "$FAIL" = "0" ]; then
-    echo "PASS — the OS-dependency chain (git, pipx, ask, Ollama) completed successfully."
+    echo "PASS — the OS-dependency chain (git, Node.js, ask, Ollama) completed successfully."
     exit 0
 else
     echo "FAIL — see $LOG for the full transcript."

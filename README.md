@@ -7,7 +7,7 @@ voice) node on the **interdata network**, run by [miniaicloud](https://github.co
 
 This is deliberately not "real miniclosedai": no chat UI, no functions, no
 local history. A node is a compute/voice contributor plus an
-[`ask`](https://github.com/edantonio505/edstui)-connected terminal — leaving
+[`ask`](https://github.com/edantonio505/eds-tui-js)-connected terminal — leaving
 as much of a small card's VRAM as possible for the model itself.
 
 ## What one install does
@@ -23,9 +23,12 @@ as much of a small card's VRAM as possible for the model itself.
    9b variant's weights alone are 6.6GB, already over 6GB before any
    context or overhead — set `OLLAMA_MODEL=qwen3.5:9b-q4_K_M` if you'd
    rather trade VRAM headroom for a larger model.)
-3. Installs the **`ask`** CLI ([edstui](https://github.com/edantonio505/edstui))
-   via pipx — done before network registration below, so a node still ends
-   up with `ask` even if Tailscale/registration fails. Then optionally
+3. Installs the **`ask`** CLI ([eds-tui](https://github.com/edantonio505/eds-tui-js),
+   published to npm as `eds-tui`) via npm — installing Node.js first if this
+   box doesn't already have a new enough version (>=20). No git clone or
+   Python/pipx toolchain needed at install time. Done before network
+   registration below, so a node still ends up with `ask` even if
+   Tailscale/registration fails. Then optionally
    configures `ask` to reach the interdata relay **directly**: miniaicloud
    exposes a full native Ollama API at `$HUB_URL/api/*` (see
    `app/routers/ollama_native.py` in miniaicloud), so `ask`'s own Ollama
@@ -108,7 +111,6 @@ already set — useful for a non-interactive/scripted install.
 | `OLLAMA_PORT` | `11434` | port Ollama listens on |
 | `OLLAMA_CONTEXT_LENGTH` | `32768` | context window, in tokens |
 | `LATINA_DIR` | `$HOME/latinavoicepod` | where to clone latinavoicepod (Linux only) |
-| `ASK_REPO` | `git+https://github.com/edantonio505/edstui.git` | override for forks |
 | `MINICLOSEDAI_NODE_ASK_API_KEY` | *(prompts, blank = skip)* | relay API key so `ask` reaches interdata directly — never commit a real value |
 | `MINICLOSEDAI_NODE_ASK_MODEL` | `qwen3.8:latest` | model `ask` asks the relay for |
 | `MINICLOSEDAI_NODE_HF` | *(prompts, not offered on RunPod)* | `1`/`0` — enable HuggingFace model support |
@@ -180,9 +182,9 @@ test/docker-smoke.sh
 
 Runs `install.sh` inside a genuinely clean `ubuntu:24.04` container (curl/
 python3/`ss` preinstalled, matching a normal Ubuntu box — but deliberately
-no git or pipx, the two dependencies that have silently gone missing on
-real hardware before) and checks that git, pipx, `ask`, and Ollama all end
-up installed correctly. It can't validate real GPU inference or the actual
+no git or Node.js, dependencies that have silently gone missing/been too
+old on real hardware before) and checks that git, Node.js, `ask` (via npm),
+and Ollama all end up installed correctly. It can't validate real GPU inference or the actual
 tailnet path a real relay would use — node registration is expected to
 fail without a real enrollment token, and that's treated as a pass as long
 as everything before it succeeded. Not a replacement for a real-hardware

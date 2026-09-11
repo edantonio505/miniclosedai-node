@@ -4,7 +4,9 @@
 # a dirty test box can re-enroll cleanly, deliberately leaving software
 # installed), this actually uninstalls it: Ollama (+ its systemd override
 # and, with confirmation, its pulled models), Tailscale (+ leaving the
-# tailnet), the `ask` CLI (edstui, pipx package `eds-tui`), a local
+# tailnet), the `ask` CLI (eds-tui, npm package `eds-tui` — or, from a
+# prior version of install.sh, the same pipx-installed Python package), a
+# local
 # latinavoicepod checkout if one exists, and — if HuggingFace model support
 # was enabled — the model manager service, its cloned repo, and the
 # mcai-node CLI.
@@ -56,12 +58,23 @@ prompt() {
 printf '%sminiclosedai-node uninstaller%s\n' "$BOLD" "$RST"
 echo
 
-# ---------- 1. ask (edstui) ----------
+# ---------- 1. ask (eds-tui) ----------
+# Checks both npm (the current install method) and pipx (what a node
+# enrolled via an older install.sh would have used) — a node may have
+# either, and this should clean up whichever is actually present.
+REMOVED_ASK=0
+if command -v npm >/dev/null 2>&1 && npm list -g eds-tui --depth=0 >/dev/null 2>&1; then
+    say "Removing the ask CLI (npm package eds-tui)…"
+    npm uninstall -g eds-tui >/dev/null 2>&1 && { ok "ask CLI removed"; REMOVED_ASK=1; } \
+        || warn "npm uninstall -g eds-tui failed — remove manually"
+fi
 if command -v pipx >/dev/null 2>&1 && pipx list --short 2>/dev/null | grep -q '^eds-tui '; then
-    say "Removing the ask CLI (pipx package eds-tui)…"
-    pipx uninstall eds-tui >/dev/null 2>&1 && ok "ask CLI removed" || warn "pipx uninstall eds-tui failed — remove manually"
-else
-    say "ask CLI not installed via pipx — nothing to remove."
+    say "Removing the ask CLI (old pipx package eds-tui, from a prior install)…"
+    pipx uninstall eds-tui >/dev/null 2>&1 && { ok "ask CLI (pipx) removed"; REMOVED_ASK=1; } \
+        || warn "pipx uninstall eds-tui failed — remove manually"
+fi
+if [ "$REMOVED_ASK" = "0" ]; then
+    say "ask CLI not installed (checked npm and pipx) — nothing to remove."
 fi
 
 # ---------- 2. Ollama ----------
