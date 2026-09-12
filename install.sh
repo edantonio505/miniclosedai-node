@@ -32,11 +32,11 @@
 #      Ollama's default 5-minute idle timeout — the relay may route to this
 #      node unpredictably, and a cold-load on the first request after any
 #      quiet period would be bad latency.
-#   3. Installs the `ask` CLI (published to npm as `eds-tui`) via npm —
-#      installing Node.js first if this box doesn't already have a new
-#      enough version. Deliberately done before network registration below,
-#      so a node still ends up with `ask` even if Tailscale/registration
-#      fails — useful for debugging exactly that.
+#   3. Installs the `ask` CLI (npm package `eds-tui`) via eds-tui-js's own
+#      install.sh — installing Node.js first if this box doesn't already
+#      have a new enough version. Deliberately done before network
+#      registration below, so a node still ends up with `ask` even if
+#      Tailscale/registration fails — useful for debugging exactly that.
 #      Then optionally configures `ask` to reach the interdata relay
 #      DIRECTLY (miniaicloud exposes a native Ollama API at $HUB_URL/api/*,
 #      not just this node's own small model) — needs a relay API key (an
@@ -173,10 +173,11 @@ ensure_tool() {
         || warn "couldn't install $apt_pkg automatically — install it manually, then re-run"
 }
 # Needed for the optional latinavoicepod / miniclosedai-node (HuggingFace
-# support) clones further down — not guaranteed present on a fresh box
-# (this dev machine always has it, which is why a prior version of this
-# script went uncaught missing it entirely).
-ensure_tool git git git "required to clone latinavoicepod / miniclosedai-node when those optional steps are used"
+# support) clones further down, AND for eds-tui-js's own install.sh below —
+# not guaranteed present on a fresh box (this dev machine always has it,
+# which is why a prior version of this script went uncaught missing it
+# entirely).
+ensure_tool git git git "required to clone latinavoicepod / miniclosedai-node, and to install the ask CLI"
 # Ollama's own official installer extracts a .tar.zst archive and hard-fails
 # with "This version requires zstd for extraction" if it's missing — not
 # guaranteed present either (surfaced on arm64 while building this script's
@@ -437,22 +438,33 @@ else
     warn "model doesn't show as loaded in 'ollama ps' — check 'sudo journalctl -u ollama -n 30 --no-pager' if the node responds slowly to its first request"
 fi
 
-# ---------- 3. ask (eds-tui, via npm) ----------
+# ---------- 3. ask (eds-tui, via eds-tui-js's own installer) ----------
 # Installed here, before network registration, so a node still ends up with
 # `ask` even if Tailscale/registration fails further down — this used to
 # run last, so a registration hiccup meant the script never reached it at
 # all, compounding the very problem `ask` would help debug.
 #
-# eds-tui (the `ask` CLI) is a TypeScript/Node package published to npm —
-# no git clone or Python/pipx toolchain needed on the target machine at
-# install time, which is the entire reason it was rewritten from the
-# original Python/pipx-installed edstui: a `pipx install git+https://...`
-# had to successfully clone the repo on every single target box, and that
-# step alone was the single most common real-world failure across this
-# script's whole install history (TLS/clock issues, a missing git binary,
-# PEP 668 breaking pipx itself, a flat `git clone` failure on at least one
-# real Raspberry Pi). `npm install -g eds-tui` just downloads a prebuilt
-# package from the registry over HTTPS instead.
+# eds-tui (the `ask` CLI) is a TypeScript/Node package — no Python/pipx
+# toolchain needed on the target machine at install time, which is the
+# entire reason it was rewritten from the original Python/pipx-installed
+# edstui: a `pipx install git+https://...` had to successfully clone the
+# repo on every single target box, and that step alone was the single most
+# common real-world failure across this script's whole install history
+# (TLS/clock issues, a missing git binary, PEP 668 breaking pipx itself, a
+# flat `git clone` failure on at least one real Raspberry Pi).
+#
+# NOT installed via a bare `npm install -g eds-tui` (the eventual, simpler
+# intended form) — the npm registry publish for eds-tui is currently stuck
+# on an old version (a publishing-account access issue, unrelated to its
+# code), and separately, `npm install -g git+https://github.com/...` for
+# that repo was directly tested and confirmed unreliable: it can report
+# success while silently producing an incomplete install, with no visible
+# error. Instead this curls eds-tui-js's own install.sh, which clones with
+# a plain `git clone` (not npm's own git-fetch) and installs a locally
+# `npm pack`ed tarball — confirmed reliable in repeated testing where the
+# direct methods above were not. See that script/eds-tui-js's README for
+# the full reasoning; update this block once the npm registry publish is
+# fixed and a bare `npm install -g eds-tui@latest` is reliable again.
 #
 # eds-tui needs Node.js >=20; a fresh/older box may not have that (or any
 # Node at all), so install/upgrade it first via NodeSource's official setup
@@ -475,16 +487,17 @@ if [ "$NODE_MAJOR_OK" != "1" ]; then
     if command -v node >/dev/null 2>&1; then
         ok "Node.js $(node -v) installed"
     else
-        warn "couldn't install Node.js automatically — install it manually (https://nodejs.org), then: npm install -g eds-tui"
+        warn "couldn't install Node.js automatically — install it manually (https://nodejs.org), then re-run"
     fi
 fi
 
 if command -v npm >/dev/null 2>&1; then
     say "Installing the \`ask\` CLI (eds-tui)…"
-    npm install -g eds-tui --silent 2>/dev/null && ok "ask CLI ready — run \`ask\` from any shell" \
-        || warn "npm install of eds-tui failed (network?) — re-run later: npm install -g eds-tui"
+    curl -fsSL https://raw.githubusercontent.com/edantonio505/eds-tui-js/main/install.sh 2>/dev/null | bash >/dev/null 2>&1 \
+        && ok "ask CLI ready — run \`ask\` from any shell" \
+        || warn "ask CLI install failed (network?) — re-run later: curl -fsSL https://raw.githubusercontent.com/edantonio505/eds-tui-js/main/install.sh | bash"
 else
-    warn "npm still isn't available after the Node.js bootstrap — \`ask\` was skipped. Install Node.js manually, then: npm install -g eds-tui"
+    warn "npm still isn't available after the Node.js bootstrap — \`ask\` was skipped. Install Node.js manually, then: curl -fsSL https://raw.githubusercontent.com/edantonio505/eds-tui-js/main/install.sh | bash"
 fi
 
 # `ask` talks to whatever Ollama-shaped host EDS_TUI_URL points at using

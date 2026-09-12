@@ -35,10 +35,11 @@
          refuses to register a backend known to be unreachable. Reports the
          node's base_url via POST /api/nodes/register — enabled on the
          interdata network immediately, no extra manual admin-approval step.
-      4. Installs the `ask` CLI (published to npm as `eds-tui`) via npm —
-         installing Node.js first if needed — then optionally points it at
-         the interdata relay directly (needs a relay API key — an
-         admin-minted ApiKey, not this node's own registration secret).
+      4. Installs the `ask` CLI (npm package `eds-tui`) via eds-tui-js's own
+         install.ps1 — installing Node.js first if needed — then optionally
+         points it at the interdata relay directly (needs a relay API
+         key — an admin-minted ApiKey, not this node's own registration
+         secret).
 
     NOT included on Windows: the local Latina voice pod option from
     install.sh. latinavoicepod's own setup assumes apt-get and a
@@ -265,17 +266,29 @@ try {
 }
 Ok "registered: backend #$($register.backend_id) -> $($register.base_url)"
 
-# ---------- 4. ask (eds-tui, via npm) ----------
-# eds-tui (the `ask` CLI) is a TypeScript/Node package published to npm —
-# no git clone or Python/pipx toolchain needed on the target machine at
-# install time, which is the entire reason it was rewritten from the
-# original Python/pipx-installed edstui: a `pipx install git+https://...`
-# had to successfully clone the repo on every single target box, and that
-# was the single most common real-world install failure across this
-# script's history. `npm install -g eds-tui` just downloads a prebuilt
-# package from the registry over HTTPS instead. Needs Node.js >=20;
-# install it via winget if this box doesn't already have a new enough
-# version.
+# ---------- 4. ask (eds-tui, via eds-tui-js's own installer) ----------
+# eds-tui (the `ask` CLI) is a TypeScript/Node package — no Python/pipx
+# toolchain needed on the target machine at install time, which is the
+# entire reason it was rewritten from the original Python/pipx-installed
+# edstui: a `pipx install git+https://...` had to successfully clone the
+# repo on every single target box, and that was the single most common
+# real-world install failure across this script's history.
+#
+# NOT installed via a bare `npm install -g eds-tui` (the eventual, simpler
+# intended form) — the npm registry publish for eds-tui is currently stuck
+# on an old version (a publishing-account access issue, unrelated to its
+# code), and separately, `npm install -g git+https://github.com/...` for
+# that repo was directly tested and confirmed unreliable: it can report
+# success while silently producing an incomplete install, with no visible
+# error. Instead this fetches eds-tui-js's own install.ps1, which clones
+# with a plain `git clone` (not npm's own git-fetch) and installs a
+# locally `npm pack`ed tarball — confirmed reliable in repeated testing
+# where the direct methods above were not. Update this block once the npm
+# registry publish is fixed and a bare `npm install -g eds-tui@latest` is
+# reliable again.
+#
+# Needs Node.js >=20 and git; install both via winget if this box doesn't
+# already have new-enough versions.
 $nodeMajorOk = $false
 if (Get-Command node -ErrorAction SilentlyContinue) {
     try {
@@ -292,14 +305,28 @@ if (-not $nodeMajorOk) {
     if (Get-Command node -ErrorAction SilentlyContinue) {
         Ok "Node.js $(node -v) installed"
     } else {
-        Warn "couldn't install Node.js automatically - install it manually (https://nodejs.org), then: npm install -g eds-tui"
+        Warn "couldn't install Node.js automatically - install it manually (https://nodejs.org), then re-run"
+    }
+}
+if (-not (Get-Command git -ErrorAction SilentlyContinue)) {
+    Say "Installing git (needed to install the ask CLI reliably right now)..."
+    if (Get-Command winget -ErrorAction SilentlyContinue) {
+        winget install --silent --accept-package-agreements --accept-source-agreements Git.Git
+        $env:Path = "$env:ProgramFiles\Git\cmd;$env:Path"
+    }
+    if (-not (Get-Command git -ErrorAction SilentlyContinue)) {
+        Warn "couldn't install git automatically - install it manually (https://git-scm.com), then re-run"
     }
 }
 
-if (Get-Command npm -ErrorAction SilentlyContinue) {
+if ((Get-Command npm -ErrorAction SilentlyContinue) -and (Get-Command git -ErrorAction SilentlyContinue)) {
     Say "Installing the ask CLI (eds-tui)..."
-    npm install -g eds-tui --silent
-    Ok "ask CLI ready - open a new terminal and run: ask"
+    try {
+        Invoke-RestMethod https://raw.githubusercontent.com/edantonio505/eds-tui-js/main/install.ps1 | Invoke-Expression
+        Ok "ask CLI ready - open a new terminal and run: ask"
+    } catch {
+        Warn "ask CLI install failed (network?) - re-run later: irm https://raw.githubusercontent.com/edantonio505/eds-tui-js/main/install.ps1 | iex"
+    }
 
     # `ask` talks to whatever Ollama-shaped host EDS_TUI_URL points at
     # using Ollama's own native wire protocol — miniaicloud (the relay)
@@ -326,7 +353,7 @@ if (Get-Command npm -ErrorAction SilentlyContinue) {
         Say "No relay API key given - ask is installed but not yet pointed at interdata. Set EDS_TUI_URL/EDS_TUI_TOKEN later (see miniclosedai-node's README)."
     }
 } else {
-    Warn "npm still isn't available after the Node.js bootstrap - ask CLI was skipped. Install Node.js manually, then: npm install -g eds-tui"
+    Warn "npm or git still isn't available after the bootstrap above - ask CLI was skipped. Install Node.js and git manually, then: irm https://raw.githubusercontent.com/edantonio505/eds-tui-js/main/install.ps1 | iex"
 }
 
 Write-Host ""
